@@ -85,10 +85,10 @@
 
 本文档已通过 Oracle 高精度 Gate Review。修订要点（详见各节）：
 
-- **P0**：`session.peek_body()` 在 Pingora 0.8.1 不存在（PR #907 关闭未合并）→ 原方案 `enable_retry_buffering()` + `read_body_bytes().await`；**后经零拷贝修订（见下条）废弃 `enable_retry_buffering`**，改为自实现 `Vec<Bytes>` 累加器 + 首 chunk `read_body_bytes`；新增大请求体策略（§6.3、§8.5）。
+- **P0**：`session.peek_body()` 在 Pingora 0.8.1 不存在（PR #907 关闭未合并）→ 用 `read_body_bytes().await` 读首 chunk + `memchr` 提取 model。**W4 spike 验证**：`request_filter` 中 `read_body_bytes` 前需 `enable_retry_buffering()`（Pingora 默认）以回放首 chunk 正常转发；故障转移重放用自实现 `Vec<Bytes>` 累加器（不依赖 Pingora 的 64KiB retry buffer，大 body 安全）。详见 §6.3、§8.5。
 - **P1**：SWRR 状态重置（§5.3、§7.2）；`TenantModel` 闸门接入路由（§7.1）；`pingora-prometheus` 改自托管（§1.1）；熔断器（§8.4）；故障转移计费竞态对齐 + `retry_after_connect` 配置（§8.1、§8.3）；Anthropic usage schema（§9.4）。
 - **P2**：`weight=0` 语义（§7.2）、配置加载校验（§5.3）、`AuthVerdict` 携带状态码（§11.6）、证书单一数据源（§5.2、§12.1）、metrics 目录（§17）、非 JSON 路径（§6.3）、`/v1` 重写边界（§6.5）、短路面 body 处理（§6.3）。
-- **零拷贝修订（用户强制需求）**：禁止在热路径对主体载荷做 JSON 反复 encode/decode。请求/响应 body 原样转发；`"model"` 提取与 `"usage"` 扫描改用 `memchr` SIMD 字节扫描（零分配、零 JSON 解析）；故障转移重放改用自实现 `Vec<Bytes>` 累加器（Pingora 内建 `enable_retry_buffering` 的 64KiB 限制对 LLM body 失效）。详见 §6 零拷贝原则、§6.3、§6.6、§8.5、§9.4。
+- **零拷贝修订（用户强制需求）**：禁止在热路径对主体载荷做 JSON 反复 encode/decode。请求/响应 body 原样转发；`"model"` 提取与 `"usage"` 扫描用 `memchr` SIMD 字节扫描（零分配、零 JSON 解析）；首 chunk 正常转发经 `enable_retry_buffering()` 回放（Pingora 默认，W4 验证），故障转移重放用自实现 `Vec<Bytes>` 累加器（不受 64KiB 限制）。详见 §6 零拷贝原则、§6.3、§6.6、§8.5、§9.4。
 
 ---
 
@@ -478,7 +478,7 @@ impl ConfigStore {
 - **请求体**：**禁止**整体 `serde_json::from_slice`。仅用 `memchr` SIMD 字节扫描从**首 chunk**提取 `"model"` 字段（约 ~20 字节即早退，零分配）；body 字节**原样转发**上游，不反序列化、不再序列化。
 - **响应体（SSE）**：逐 chunk 用 `memchr` 扫描 `"usage"`（零分配、内存带宽级，~10 GB/s）；**仅**命中时反序列化该 chunk（~50 字节）提取用量，99%+ chunk 零 JSON 开销；body **原样透传**客户端，不重组、不再编码。
 - **改写**：api-key 替换、`/v1` 重写、Host 改写**只动 header**（`upstream_request_filter` 只收 `&mut RequestHeader`，物理上碰不到 body）。
-- **故障转移重放**：Pingora 内建 `enable_retry_buffering` 的 `BODY_BUF_LIMIT = 64 KiB` 对 LLM body（1–10 MiB）**必然截断失效**（截断后重放会送出残缺 body）→ **自实现** `Vec<Bytes>` 累加器：每 chunk `Bytes::clone()` = O(1) 原子引用计数自增，**零 memcpy**；重放时按序 `write_body(&chunk)`。
+- **故障转移重放**（双机制，W4 spike 验证）：(a) **首 chunk 正常转发**——`request_filter` 中 `read_body_bytes` 前调用 `enable_retry_buffering()`（Pingora 默认行为），由 Pingora 回放已消费首 chunk → 上游收到完整 body；(b) Pingora 的 64KiB `BODY_BUF_LIMIT` 仅影响其**自身 retry**（截断后 Pingora 内部 retry 失败），本系统**不依赖**它，故障转移重放改用**自实现 `Vec<Bytes>` 累加器**：每 chunk `Bytes::clone()` = O(1) 原子引用计数自增，**零 memcpy、不受 64KiB 限制、大 body 安全**；重放时按序 `write_body(&chunk)`。
 
 **最小不可避免拷贝**（诚实标注，非"绝对零拷贝"）：
 
@@ -529,7 +529,7 @@ impl ConfigStore {
 [logging]                   计算 latency/usage → UsageSink.record + 指标(§17) + 访问日志 + 喂熔断器(成功)
 ```
 
-> 注：④ 仅用 `memchr` 扫描首 chunk 提取 model（零 JSON 解析）；故障转移重放用自实现 `Vec<Bytes>` 累加器（§8.5），**不**用 Pingora 的 `enable_retry_buffering`（其 64KiB 限制对 LLM body 必然截断失效）。
+> 注：④ 用 `memchr` 扫描首 chunk 提取 model（零 JSON 解析）；首 chunk 正常转发经 `enable_retry_buffering()` 回放（Pingora 默认），故障转移重放用自实现 `Vec<Bytes>` 累加器（§8.5，不依赖 64KiB retry buffer）。
 
 ### 6.2 `RequestContext`（per-request CTX）
 
@@ -577,7 +577,7 @@ pub struct SelectedRoute {
    - **不**整体读取/反序列化请求体。`request_filter` 内 `read_body_bytes().await` 仅读**首个** chunk，用 `memchr::memmem::find(chunk, b"\"model\"")` SIMD 扫描（约 ~20 字节早退、零分配）得 `model_key`；
    - 该首 chunk 存入 `ctx.body_buffer`（`Vec<Bytes>`）；**首 chunk 转发机制**（W4 spike 验证）：`read_body_bytes` 消耗首 chunk 后，Pingora 自动转发只处理后续 chunk，故须在 `connected_to_upstream`/`upstream_request_filter` 阶段手动 `upstream_session.write_body(&first_chunk)` 预写首 chunk，再让自动转发接管后续；**回退方案**：若手动预写无法与自动转发干净交错，则 `request_body_filter` 首次调用时把存的首 chunk 与当前 chunk 拼接注入（一次小 memcpy，仅首 chunk 大小）；
    - 其余 chunk 由 `request_body_filter` 增量 `push(chunk.clone())` 到 `ctx.body_buffer` + 原样转发上游；
-   - **不**调用 `enable_retry_buffering`（64KiB 限制对 LLM body 截断失效）；故障转移重放用 `ctx.body_buffer`（§8.5）；
+   - `request_filter` 中 `read_body_bytes` 前调用 `enable_retry_buffering()`（Pingora 默认），由 Pingora 回放首 chunk 正常转发（W4 spike 验证）；故障转移重放用 `ctx.body_buffer`（§8.5，不依赖 64KiB retry buffer）；
    - 首 chunk 即含 `model`（OpenAI 兼容格式 `"model"` 在最前），无需读完整 1–10MB body；
    - 解析失败/非 JSON/无 model → 见 §6.3a 处理。
 6. **路由**：调用 `router::resolve(&store, &breaker, tenant, model_key)` → 得 `candidates`；为空 → 404/403。
@@ -799,7 +799,7 @@ impl CircuitBreaker {
 
 ### 8.5 大请求体、零拷贝重放与故障转移（修订 P0-B1 / P1-C3 / 零拷贝）
 
-**自实现重放缓冲**（取代失效的 `enable_retry_buffering`）：Pingora 内建 `enable_retry_buffering` 的 `BODY_BUF_LIMIT = 64KiB` 对 LLM body（1–10MiB）必然截断 → 本系统在 `ctx.body_buffer: Vec<Bytes>` 中累积请求体：
+**双机制（W4 spike 验证）**：(a) **首 chunk 正常转发**——`request_filter` 中 `read_body_bytes` 前调用 `enable_retry_buffering()`（Pingora 默认行为），由 Pingora 回放已消费首 chunk，上游收到完整 body；(b) **故障转移重放**——Pingora 的 64KiB `BODY_BUF_LIMIT` 仅影响其自身 retry，本系统不依赖，改用 `ctx.body_buffer: Vec<Bytes>` 累积请求体：
 
 - **累积**：`request_filter` 读首 chunk（提取 model）+ `request_body_filter` 逐 chunk `push(chunk.clone())`（`Bytes::clone()` = O(1) 引用计数自增，**零 memcpy**）；
 - **转发**：body 同时原样转发上游（不缓冲阻塞、不重组、不再编码）；
@@ -1370,7 +1370,7 @@ PRAGMA mmap_size = 134217728;
 - `MockAuthChecker` 单测/集成测试。
 
 ### Phase 3 — 路由与代理核心（2.5d）
-- `request_filter`：域名/tenant/`read_body_bytes` 仅读首 chunk + `memchr` 提取 model_key（**禁用 `enable_retry_buffering`**，用 `Vec<Bytes>` 累加器）；
+- `request_filter`：域名/tenant/`enable_retry_buffering()` + 首 chunk `read_body_bytes` + `memchr` 提取 model_key；故障转移重放用 `Vec<Bytes>` 累加器（§8.5）；
 - `router::resolve`：**TenantModel 闸门** + 交集 + 熔断过滤（纯函数单测覆盖）；
 - `swrr::order`（SWRR + `reload_all` 清空）；
 - `upstream_peer` + `upstream_request_filter` 改写（含 `/v1` 重写规则）；
@@ -1423,7 +1423,8 @@ PRAGMA mmap_size = 134217728;
 | 改写请求头 | `upstream_request_filter(&mut RequestHeader)` | |
 | 逐 chunk 观察流 | `upstream_response_body_filter(&mut Option<Bytes>)` | |
 | 自写响应 | `session.write_response_header()` + `write_response_body()` | 短路面 + `set_keepalive(None)` |
-| 缓存请求体供重放 | **自实现** `Vec<Bytes>` 累加器（`Bytes::clone` O(1)） | Pingora `enable_retry_buffering` 64KiB 对 LLM body 失效 |
+| 首 chunk 正常转发 | `enable_retry_buffering()`（Pingora 默认，回放首 chunk） | W4 spike 验证；64KiB 仅影响 Pingora 内部 retry |
+| 故障转移重放 | **自实现** `Vec<Bytes>` 累加器（`Bytes::clone` O(1)，不受 64KiB 限制） | 大 body 安全 |
 | 读取请求体（首 chunk） | `session.downstream_session.read_body_bytes().await` | 仅读首 chunk 提取 model，其余增量转发 |
 | 零拷贝元数据提取 | `memchr::memmem::find(&[u8], needle)` | SIMD、零分配；扫描 model/usage |
 | 加权 RR | 自实现 SWRR | 内建 LB 无权重 |

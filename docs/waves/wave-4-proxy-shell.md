@@ -43,7 +43,7 @@
 ### 2.2 Spike：Pingora 最小集成（0.4d）—— 先验证 API 再铺开
 - T2.1 `spike_request_filter_short_circuit`：最小 `ProxyHttp`，`request_filter` 写 200 "ok" → `Ok(true)`；启动真实 Pingora server + reqwest 客户端请求，断言收 200。
 - T2.2 `spike_first_chunk_model_extract`：`read_body_bytes().await` 仅读首 chunk + W1 `extract_model`（`memchr`）提取 model；**首 chunk 必须回填 `ctx.body_buffer` 并原样转发**，验证上游收到完整 body（零拷贝，design §6.3）。
-- T2.3 `spike_vec_bytes_replay`：`ctx.body_buffer: Vec<Bytes>` 累积（`Bytes::clone` O(1)）+ `request_body_filter` 增量 push；故障转移时遍历重放，验证上游收到等价 body。**禁用 `enable_retry_buffering`**（其 64KiB 对 LLM body 失效）。
+- T2.3 `spike_vec_bytes_replay`：`ctx.body_buffer: Vec<Bytes>` 累积（`Bytes::clone` O(1)）+ `request_body_filter` 增量 push；故障转移时遍历重放，验证上游收到等价 body。**【W4 spike 结果】首 chunk 正常转发需 `enable_retry_buffering()`（Pingora 默认，回放已消费首 chunk；手动 `request_body_filter` 再注入失败——小 body 时 `is_body_done` 跳过转发）；64KiB 仅影响 Pingora 自身 retry，故障转移重放用 `Vec<Bytes>`（不受限）。**
 - T2.4 `spike_body_too_large_threshold`：累积字节达 `[proxy] max_request_body` 软上限 → `body_too_large=true`（停止累积，body 仍原样转发）；超 `max_request_body_hard` → 413。
 > Spike 用例可保留为集成测试。
 
@@ -113,7 +113,7 @@
 - [ ] 熔断 dead-set 经集成测试验证（mark/probe/revive）；
 - [ ] 多租户 TLS 端到端选证书 + 热更新验证；
 - [ ] 生产代码无内部 mock；Spy Sink 是 `UsageSink` 的真实测试实现（计数），不绕过逻辑；
-- [ ] 热路径零拷贝：body 原样转发、`"model"`/`"usage"` 用 `memchr` 提取、重放用 `Vec<Bytes>`；生产代码 grep 无 `enable_retry_buffering`、无 `serde_json::from_slice` 作用于完整 body。
+- [ ] 热路径零拷贝：body 原样转发、`"model"`/`"usage"` 用 `memchr` 提取、故障转移重放用 `Vec<Bytes>`；生产代码 grep 无 `serde_json::from_slice` 作用于完整 body（注：`enable_retry_buffering()` 用于首 chunk 正常转发，W4 验证，允许）。
 
 ---
 

@@ -43,7 +43,7 @@
 - 请求/响应的**主体载荷**（prompt、token 流）**原样转发**，**禁止**对完整 body 做 `serde_json::from_slice`→改→再序列化。
 - 少量元数据（`"model"`、`"usage"`）一律用 **`memchr` SIMD 字节扫描**提取（零分配、早退），命中处仅反序列化该小切片。
 - 改写只动 header（`upstream_request_filter` 物理上碰不到 body）。
-- 故障转移重放用**自实现 `Vec<Bytes>` 累加器**（`Bytes::clone` = O(1) 引用计数自增，零 memcpy）；**禁用** Pingora 的 `enable_retry_buffering`（其 64KiB `BODY_BUF_LIMIT` 对 LLM body 必然截断失效）。
+- 首 chunk 正常转发：`request_filter` 中 `read_body_bytes` 前调用 `enable_retry_buffering()`（Pingora 默认行为，回放已消费首 chunk，W4 spike 验证）；故障转移重放用**自实现 `Vec<Bytes>` 累加器**（`Bytes::clone` = O(1) 引用计数自增，零 memcpy，不受 64KiB 限制，大 body 安全）。Pingora 的 64KiB `BODY_BUF_LIMIT` 仅影响其自身 retry，本系统不依赖。
 - 诚实边界：H1 路径每 chunk 1 次内核拷贝（Pingora core 限制，不改 core 无法消除）；H2 路径真正零拷贝。本"零拷贝"指**应用层零 JSON 往返 + 引用计数式搬运**，非内核 `splice`/`sendfile`。
 - 详见 `design.md` §6 零拷贝原则、§6.3、§6.6、§8.5、§9.4。
 
@@ -169,7 +169,7 @@ hydra/
 - [ ] `cargo clippy -- -D warnings`、`cargo fmt --check` 通过；
 - [ ] 本波次 TDD 任务全绿；
 - [ ] 生产代码零 mock/零桩/零 `#[cfg(test)]` 分支（code review + grep 校验）；
-- [ ] 热路径零 JSON 反复编解码：body 原样转发，`"model"`/`"usage"` 用 `memchr` 提取，重放用 `Vec<Bytes>`（grep 校验：无 `serde_json::from_slice` 作用于完整 body、无 `enable_retry_buffering`）；
+- [ ] 热路径零 JSON 反复编解码：body 原样转发，`"model"`/`"usage"` 用 `memchr` 提取，故障转移重放用 `Vec<Bytes>`（grep 校验：无 `serde_json::from_slice` 作用于完整 body）；注：`enable_retry_buffering()` 用于首 chunk 正常转发（Pingora 默认，W4 验证），不在禁用之列；
 - [ ] 凡外部边界，测试用真实进程级 double，并在 PR 注明。
 
 每波次额外出口准则见各自详档。
@@ -180,7 +180,7 @@ hydra/
 
 | 风险 | 缓解 |
 | --- | --- |
-| Pingora 0.8.1 API 细节偏差（`read_body_bytes` 仅读首 chunk、`enable_retry_buffering` 64KiB 失效） | W4 起步先写零拷贝 spike：验证首 chunk 读取 + `Vec<Bytes>` 重放 + body 原样转发 |
+| Pingora 0.8.1 body 转发机制（`read_body_bytes` 消费首 chunk 后需 `enable_retry_buffering` 回放） | ✅ W4 spike 已验证：`enable_retry_buffering()`（Pingora 默认）回放首 chunk 正常转发 + `Vec<Bytes>` 故障转移重放 |
 | 纯/外壳切分导致类型在 crate 间频繁搬运 | core 拥有领域类型；外壳只做 `Into/From` 转换，约定边界转换集中在 `bridge` 模块 |
 | wiremock 与 Pingora 上游集成测试复杂 | 外壳集成测试用独立 mock upstream server（真实 HTTP），不通过 Pingora mock 内部路由 |
 | 覆盖率门槛卡进度 | 仅对 `hydra-core` 设硬门槛；外壳以集成测试覆盖关键路径 |
