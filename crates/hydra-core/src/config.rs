@@ -13,6 +13,17 @@
 //! wraps the whole `ConfigData` (and, for independent cert hot-reload per
 //! design §5.2/§12.1, the certs map specifically) in `ArcSwap` at the boundary.
 //! This keeps `arc-swap` out of core's dependency firewall (dev-plan §2).
+//!
+//! ## Validation scope (design §5.4)
+//!
+//! [`validate`] covers the **pure** data-graph invariants only — referential
+//! integrity between the in-memory indexes plus structural sanity. The
+//! I/O-dependent checks from §5.4 (endpoint-URL parseability / scheme legality,
+//! cert-file readability & PEM validity, public/private-key match) are
+//! **deferred to the W2 loader**: they require network/filesystem access and
+//! therefore cannot live in this zero-I/O crate. The [`Severity::Fatal`]
+//! variant is reserved for those loader-side fatal checks; everything the pure
+//! [`validate`] emits today is [`Severity::Warn`].
 
 use std::collections::{HashMap, HashSet};
 
@@ -67,4 +78,122 @@ pub struct CertMeta {
     pub domain: String,
     pub cert_file: Option<String>,
     pub cert_key: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Load-time validation (pure data-graph checks only — see module docs).
+// ---------------------------------------------------------------------------
+
+/// How serious a [`ValidationIssue`] is.
+///
+/// `Fatal` is reserved for loader-side (W2) I/O checks — endpoint-URL
+/// parseability, cert-file readability, PEM/key validity (design §5.4) — which
+/// cannot run in this zero-I/O crate. The pure [`validate`] below currently
+/// emits only `Warn`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Severity {
+    /// Hard failure: the loader must refuse to publish this snapshot.
+    Fatal,
+    /// Recoverable defect: publish, but the affected rows are inert/filtered.
+    Warn,
+}
+
+/// One problem found while validating a [`ConfigData`] snapshot (design §5.4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationIssue {
+    pub severity: Severity,
+    pub message: String,
+}
+
+impl ValidationIssue {
+    fn warn(message: String) -> Self {
+        Self {
+            severity: Severity::Warn,
+            message,
+        }
+    }
+}
+
+/// Validate the pure, in-memory data-graph invariants of a config snapshot
+/// (design §5.4).
+///
+/// The checks performed here are exactly those that need **no I/O**:
+///
+/// - **Referential integrity (tenant_providers)** — every `provider_id` listed
+///   in `tenant_providers` exists in `providers` (`Warn`).
+/// - **Referential integrity (tenant_models)** — every `model_key` listed in
+///   `tenant_models` is offered by at least one online provider, i.e. present
+///   in `models_by_key` with a non-empty candidate list (`Warn`).
+/// - **Provider keys** — every *online* provider (`weight != 0`) has a
+///   non-empty key list in `provider_keys` (`Warn`). Soft-disabled providers
+///   (`weight == 0`) are skipped: they never become candidates.
+/// - **Limit roles** — no enabled role has both `limit_count` and `limit_token`
+///   `None` (a role matching nothing on either dimension is meaningless)
+///   (`Warn`).
+///
+/// The I/O-dependent §5.4 checks (endpoint-URL parsing, cert-file existence /
+/// PEM validity) are the W2 loader's responsibility — see the module docs.
+///
+/// Returns a deterministically ordered `Vec` (sorted by message, then severity)
+/// so callers and tests get a stable result despite `HashMap` iteration order.
+/// A clean config yields an empty `Vec`.
+pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+
+    // tenant_providers → must reference known providers.
+    for (tenant_id, provider_ids) in &cfg.tenant_providers {
+        for pid in provider_ids {
+            if !cfg.providers.contains_key(pid) {
+                issues.push(ValidationIssue::warn(format!(
+                    "tenant_provider references unknown provider_id '{pid}' (tenant '{tenant_id}')"
+                )));
+            }
+        }
+    }
+
+    // tenant_models → must be offered by ≥1 online provider.
+    for (tenant_id, model_keys) in &cfg.tenant_models {
+        for key in model_keys {
+            let offered = match cfg.models_by_key.get(key) {
+                Some(v) => v.is_empty(),
+                None => true,
+            };
+            if offered {
+                issues.push(ValidationIssue::warn(format!(
+                    "tenant_model '{key}' has no online provider (tenant '{tenant_id}')"
+                )));
+            }
+        }
+    }
+
+    // online providers (weight != 0) → must have ≥1 api_key.
+    for provider in cfg.providers.values() {
+        if provider.weight == 0 {
+            continue;
+        }
+        let has_keys = cfg
+            .provider_keys
+            .get(&provider.id)
+            .is_some_and(|v| !v.is_empty());
+        if !has_keys {
+            issues.push(ValidationIssue::warn(format!(
+                "provider '{}' has weight {} but no api_keys; it will be filtered out at candidate time",
+                provider.id, provider.weight
+            )));
+        }
+    }
+
+    // limit roles → must constrain at least one dimension.
+    for role in &cfg.limit_roles {
+        if role.limit_count.is_none() && role.limit_token.is_none() {
+            issues.push(ValidationIssue::warn(format!(
+                "limit_role '{}' has both limit_count and limit_token NULL",
+                role.id
+            )));
+        }
+    }
+
+    // Deterministic order across HashMap iterations.
+    issues.sort_by(|a, b| a.message.cmp(&b.message).then(a.severity.cmp(&b.severity)));
+    issues
 }
