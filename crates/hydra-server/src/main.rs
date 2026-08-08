@@ -8,15 +8,26 @@
 //! ## Startup sequence
 //!
 //! 1. Initialise tracing (`tracing_subscriber`).
-//! 2. Open the SQLite pool and run migrations (`db::init_pool` + `run_migrate`).
-//! 3. Load [`ConfigStore`] (builds the initial `ConfigData` snapshot).
-//! 4. Build [`HttpAuthChecker`] (reqwest + cache).
-//! 5. Build [`UsageSink`] via `build_sink`.
-//! 6. Construct [`CircuitBreaker`], [`RateLimiter`], and [`AppState`].
-//! 7. Spawn background tasks (breaker probe, limiter GC).
-//! 8. Resolve certs (if any) into the shared `HydraCertStore` (§12.1).
-//! 9. Boot Pingora with an `http_proxy_service` — TLS when certs are present,
-//!    plain TCP otherwise.
+//! 2. On a dedicated **background runtime** (so Pingora can own its own):
+//!    open the SQLite pool and run migrations, load [`ConfigStore`], build the
+//!    auth checker / usage sink / breaker / limiter, and spawn the long-lived
+//!    background tasks (breaker probe, limiter GC). The runtime is **kept
+//!    alive** for the process lifetime — the tasks need it.
+//! 3. Resolve certs (if any) into the shared `HydraCertStore` (§12.1).
+//! 4. Boot Pingora with an `http_proxy_service` — TLS when certs are present,
+//!    plain TCP otherwise — plus the admin `ServeHttp` service on its own port.
+//!
+//! ## Why not `#[tokio::main]`
+//!
+//! Pingora's [`Server::run_forever`] is **blocking** and builds its own tokio
+//! runtime internally. Calling it from inside `#[tokio::main]` (or any nested
+//! `block_on`) panics with *"Cannot start a runtime from within a runtime"*.
+//! The background runtime here is a **sibling**, not nested: we use it only for
+//! the async bootstrap + the long-lived bg tasks, drop out of `block_on`,
+//! keep the runtime alive via a binding, and let `run_forever` own the main
+//! thread and its own runtime. This is the canonical Pingora binary layout
+//! (see the integration tests in `tests/admin_api.rs` which use the same
+//! `std::thread::spawn(run_forever)` shape to avoid the nesting).
 
 use std::sync::Arc;
 
@@ -39,33 +50,60 @@ const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
 const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:8081";
 const DEFAULT_USAGE_SINK: &str = "sqlite";
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // (1) Tracing.
     let _ = tracing_subscriber::fmt::Subscriber::builder()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    info!("hydra gateway starting (W4b: downstream TLS listener)");
+    info!("hydra gateway starting (W6: UI + ops hardening)");
 
-    if let Err(e) = run().await {
-        error!(error = %e, "fatal startup error");
+    // (2) Background runtime: drives the async bootstrap AND hosts the
+    //     long-lived tasks (breaker probe, limiter GC). Kept alive for the
+    //     process lifetime via the `_bg_runtime` binding below — see the
+    //     module docs for why we don't use #[tokio::main].
+    let bg_runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!(error = %e, "failed to build background tokio runtime");
+            std::process::exit(1);
+        }
+    };
+
+    let boot = bg_runtime.block_on(bootstrap());
+    let components = match boot {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "fatal startup error");
+            std::process::exit(1);
+        }
+    };
+
+    // (3) Run Pingora on the bare main thread. `run_forever` builds its own
+    //     runtime; the bg_runtime above is a sibling (kept alive, not nested).
+    //     `_bg_runtime` is never dropped because `run_forever` diverges.
+    let _bg_runtime = bg_runtime;
+    if let Err(e) = run_server(components) {
+        error!(error = %e, "fatal pingora startup error");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // (2) DB pool + migrations.
+/// All async + shared-component construction done on the background runtime
+/// (so the resulting `Arc`s are usable both by Pingora's services and by the
+/// bg tasks that share them).
+async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> {
+    // (2a) DB pool + migrations.
     let db_url = std::env::var("HYDRA_DB_URL").unwrap_or_else(|_| DEFAULT_DB_URL.to_string());
     let pool = db::init_pool(&db_url).await?;
     db::run_migrate(&pool).await?;
     info!(db_url = %db_url, "database pool ready");
 
-    // (3) Config store (initial snapshot).
+    // (2b) Config store (initial snapshot).
     let store = ConfigStore::load(pool.clone()).await?;
     info!("config store loaded");
 
-    // (4) Auth checker.
+    // (2c) Auth checker.
     let auth_cache = AuthCache::new(
         AuthConfig::default().allow_ttl,
         AuthConfig::default().deny_ttl,
@@ -74,14 +112,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let auth = Arc::new(HttpAuthChecker::new(auth_cache, auth_config)?);
     info!("auth checker initialised");
 
-    // (5) Usage sink.
+    // (2d) Usage sink.
     let sink_kind =
         std::env::var("HYDRA_USAGE_SINK").unwrap_or_else(|_| DEFAULT_USAGE_SINK.to_string());
     let sink = build_sink(&sink_kind, Some(pool.clone()), None)?;
     let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::from(sink);
     info!(kind = %sink_kind, "usage sink built");
 
-    // (6) Build shared app state.
+    // (2e) Build shared app state.
     let proxy_cfg = ProxyConfig::default();
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(
         proxy_cfg.breaker.threshold,
@@ -97,7 +135,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         proxy: proxy_cfg.clone(),
     });
 
-    // (7) Background tasks.
+    // (2f) Background tasks (spawned onto this background runtime; they live as
+    //      long as the runtime, which is kept alive in `main`).
     let snapshot_provider = {
         let store = store.clone();
         Arc::new(move || {
@@ -115,17 +154,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     spawn_gc_task(limiter.clone(), std::time::Duration::from_secs(30));
 
-    // (8) Pingora server.
+    Ok(BootstrapComponents {
+        pool,
+        store,
+        auth,
+        breaker,
+        state,
+    })
+}
+
+/// The shared components built by [`bootstrap`] and consumed by [`run_server`].
+struct BootstrapComponents {
+    pool: sqlx::SqlitePool,
+    store: ConfigStore,
+    auth: Arc<HttpAuthChecker>,
+    breaker: Arc<CircuitBreaker>,
+    state: Arc<AppState>,
+}
+
+/// Synchronous Pingora setup: build the proxy + admin services and call
+/// [`Server::run_forever`]. Must run on a bare thread (no enclosing tokio
+/// runtime) so Pingora can build its own.
+fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> {
+    // (3a) Pingora server.
     let mut server =
         Server::new(Some(Opt::default())).map_err(|e| format!("pingora server init: {e:?}"))?;
     server.bootstrap();
 
-    let app = HydraProxy::new(state);
+    let app = HydraProxy::new(c.state);
 
     let listen_addr = std::env::var("HYDRA_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, app);
 
-    // (8a) Downstream TLS when any tenant has certs (design §12 / W4b); else
+    // (3b) Downstream TLS when any tenant has certs (design §12 / W4b); else
     //      plain TCP for the localhost/dev case. The cfg split keeps the binary
     //      buildable without a TLS backend (plain `proxy` feature). Under a TLS
     //      backend the resolved `HydraCertStore` is kept so the admin reload
@@ -134,7 +195,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (tls_enabled, cert_store) = {
         use hydra_server::tls::HydraCertStore;
 
-        let snapshot = store.snapshot();
+        let snapshot = c.store.snapshot();
         if snapshot.certs.is_empty() {
             proxy_service.add_tcp(&listen_addr);
             (false, None::<HydraCertStore>)
@@ -172,8 +233,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         info!(listen = %listen_addr, "proxy plain-TCP listener bound (no tenant certs configured)");
     }
 
-    // (9) Admin service — a second Pingora `Service` (ServeHttp) on its own
-    //     plain-TCP port (design §13.1). Same runtime, admin-token-gated.
+    // (3c) Admin service — a second Pingora `Service` (ServeHttp) on its own
+    //      plain-TCP port (design §13.1). Same runtime, admin-token-gated.
+    //      Also serves the embedded `/admin/*` UI (design §14) without the
+    //      token gate so the browser can render the login prompt.
     let admin_token = AdminService::token_from_env();
     let admin_addr =
         std::env::var("HYDRA_ADMIN_ADDR").unwrap_or_else(|_| DEFAULT_ADMIN_LISTEN.to_string());
@@ -183,7 +246,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
     let cert_reloader: Option<Arc<dyn Fn() + Send + Sync>> = cert_store.as_ref().map(|cs| {
         let cs = cs.clone();
-        let store = store.clone();
+        let store = c.store.clone();
         Arc::new(move || {
             let snap = store.snapshot();
             cs.resolve_and_store(&snap.certs);
@@ -193,10 +256,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cert_reloader: Option<Arc<dyn Fn() + Send + Sync>> = None;
 
     let admin_state = Arc::new(AdminState::new(
-        pool.clone(),
-        store.clone(),
-        auth.clone(),
-        breaker.clone(),
+        c.pool,
+        c.store,
+        c.auth,
+        c.breaker,
         admin_token.clone(),
         cert_reloader,
     ));
@@ -206,11 +269,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     admin_service.add_tcp(&admin_addr);
     server.add_service(admin_service);
     if admin_token.is_some() {
-        info!(admin = %admin_addr, "admin REST API bound (admin token configured)");
+        info!(admin = %admin_addr, "admin REST API + UI bound (admin token configured)");
     } else {
         error!(
             admin = %admin_addr,
-            "admin REST API bound but HYDRA_ADMIN_TOKEN is unset — all admin requests will be denied (§13.3)"
+            "admin REST API + UI bound but HYDRA_ADMIN_TOKEN is unset — all admin requests will be denied (§13.3)"
         );
     }
 

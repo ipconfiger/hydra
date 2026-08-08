@@ -1,0 +1,24 @@
+{
+  "//": "Seed data for the Playwright E2E suite + manual smoke. Loaded via the admin REST API by tests/e2e/seed.sh. Contains a tenant, provider, model, key, and the tenant-provider/tenant-model associations — exactly enough for the UI to show one row in each table.",
+  "providers": [
+    { "id": "p-seed", "key": "seed-openai", "name": "Seed OpenAI", "endpoint": "https://api.openai.com", "weight": 1, "created_at": "", "updated_at": "" }
+  ],
+  "provider_models": [
+    { "id": "m-seed", "key": "gpt-4o", "name": "GPT-4o", "provider_id": "p-seed", "status": 1 }
+  ],
+  "provider_keys": [
+    { "id": "k-seed", "provider_id": "p-seed", "api_key": "sk-seed-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "created_at": "" }
+  ],
+  "tenants": [
+    { "id": "t-seed", "name": "Seed Tenant", "domain": "seed.example.com", "auth_url": "https://auth.seed.example.com/v1/verify", "cert_key": null, "cert_file": null, "enabled": true, "created_at": "", "updated_at": "" }
+  ],
+  "tenant_providers": [
+    { "id": "tp-seed", "tenant_id": "t-seed", "provider_id": "p-seed" }
+  ],
+  "tenant_models": [
+    { "id": "tm-seed", "tenant_id": "t-seed", "model_key": "gpt-4o" }
+  ],
+  "limit_roles": [
+    { "id": "r-seed", "name": "Seed 10/min", "matching_tenant": "t-seed", "matching_key": null, "matching_model": null, "matching_provider": null, "limit_count": 10, "limit_token": null, "window": "m", "enabled": true, "created_at": "" }
+  ]
+}
