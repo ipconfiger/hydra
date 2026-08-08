@@ -1,8 +1,9 @@
 //! `hydra` — Pingora-based LLM gateway binary (design §6.1 / §15.1).
 //!
 //! Boots a [`pingora_core::server::Server`] hosting one `http_proxy_service`
-//! running [`HydraProxy`]. W4a uses a plain `add_tcp` listener; downstream TLS
-//! (multi-tenant SNI cert callback) is W4b (design §12).
+//! running [`HydraProxy`]. The listener is downstream TLS (per-tenant SNI cert
+//! callback, design §12 / W4b) whenever any tenant has certs configured; a
+//! plain `add_tcp` listener is used for the localhost/dev case (no certs).
 //!
 //! ## Startup sequence
 //!
@@ -13,7 +14,9 @@
 //! 5. Build [`UsageSink`] via `build_sink`.
 //! 6. Construct [`CircuitBreaker`], [`RateLimiter`], and [`AppState`].
 //! 7. Spawn background tasks (breaker probe, limiter GC).
-//! 8. Boot Pingora with an `http_proxy_service` on the configured address.
+//! 8. Resolve certs (if any) into the shared `HydraCertStore` (§12.1).
+//! 9. Boot Pingora with an `http_proxy_service` — TLS when certs are present,
+//!    plain TCP otherwise.
 
 use std::sync::Arc;
 
@@ -41,7 +44,7 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    info!("hydra gateway starting (W4a: plain TCP listener)");
+    info!("hydra gateway starting (W4b: downstream TLS listener)");
 
     if let Err(e) = run().await {
         error!(error = %e, "fatal startup error");
@@ -119,9 +122,50 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let listen_addr = std::env::var("HYDRA_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, app);
-    proxy_service.add_tcp(&listen_addr);
+
+    // (8a) Downstream TLS when any tenant has certs (design §12 / W4b); else
+    //      plain TCP for the localhost/dev case. The cfg split keeps the binary
+    //      buildable without a TLS backend (plain `proxy` feature).
+    #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
+    let tls_enabled = {
+        use hydra_server::tls::HydraCertStore;
+
+        let snapshot = store.snapshot();
+        if snapshot.certs.is_empty() {
+            proxy_service.add_tcp(&listen_addr);
+            false
+        } else {
+            // Resolve CertMeta → parsed certs into the shared ArcSwap (§12.1
+            // single source). The box inside TlsSettings shares this same
+            // ArcSwap, so hot-reload only needs another `resolve_and_store`
+            // after `reload_all`.
+            let cert_store = HydraCertStore::new(None);
+            cert_store.resolve_and_store(&snapshot.certs);
+            match cert_store.build_tls_settings() {
+                Ok(settings) => {
+                    proxy_service.add_tls_with_settings(&listen_addr, None, settings);
+                    true
+                }
+                Err(e) => {
+                    error!(error = %e, "failed to build TLS settings; falling back to plain TCP");
+                    proxy_service.add_tcp(&listen_addr);
+                    false
+                }
+            }
+        }
+    };
+    #[cfg(not(any(feature = "tls-boringssl", feature = "tls-openssl")))]
+    let tls_enabled = {
+        proxy_service.add_tcp(&listen_addr);
+        false
+    };
+
     server.add_service(proxy_service);
 
-    info!(listen = %listen_addr, "proxy listener bound");
+    if tls_enabled {
+        info!(listen = %listen_addr, "proxy TLS listener bound (per-tenant SNI cert callback)");
+    } else {
+        info!(listen = %listen_addr, "proxy plain-TCP listener bound (no tenant certs configured)");
+    }
     server.run_forever();
 }

@@ -27,8 +27,17 @@ default = []
 #                  Required by every I/O module.
 # - `db`         : sqlx pool / migrations / repo (W2).
 # - `http-client`: reqwest auth upstream (W3).
-# - `proxy`      : pingora proxy shell + TLS (W4) — pulls BoringSSL.
-# - `server`     : umbrella for full/W4+ builds (= db + http-client + proxy).
+# - `proxy`        : pingora proxy shell over plain TCP (W4a). No TLS backend —
+#                   the plain `add_tcp` listener. Enables `tls` only via a
+#                   backend feature below.
+# - `tls-boringssl`: downstream per-tenant TLS via Pingora's BoringSSL backend
+#                   (design §12.1 default). `HydraCertStore` SNI cert callback.
+# - `tls-openssl`  : same downstream TLS via the OpenSSL backend (design §12.1
+#                   explicitly allows "BoringSSL/OpenSSL 衍生"); use where the
+#                   vendored BoringSSL build is impractical (e.g. macOS without a
+#                   working Go/cmake toolchain).
+# - `server`     : umbrella for full/W4+ builds (= db + http-client + proxy +
+#                   tls-boringssl default).
 # - `usage-clickhouse`: optional ClickHouse usage sink (design §9.3).
 runtime = [
     "dep:tokio",
@@ -44,7 +53,13 @@ runtime = [
 db = ["runtime", "dep:sqlx"]
 http-client = ["runtime", "dep:reqwest"]
 proxy = ["runtime", "dep:pingora", "dep:pingora-proxy", "dep:pingora-core", "dep:pingora-http", "dep:rand", "dep:async-trait", "dep:bytes", "dep:http"]
-server = ["db", "http-client", "proxy"]
+# Downstream TLS backends (design §12.1). Exactly one should be combined with
+# `proxy`/`server`. Both imply `proxy` (the shell) and forward the matching
+# backend feature to every pingora crate so the same TLS impl is linked
+# everywhere (feature unification). `dep:`/`?` syntax keeps the deps optional.
+tls-boringssl = ["proxy", "pingora-core?/boringssl", "pingora?/boringssl", "pingora-proxy?/boringssl"]
+tls-openssl = ["proxy", "pingora-core?/openssl", "pingora?/openssl", "pingora-proxy?/openssl"]
+server = ["db", "http-client", "proxy", "tls-boringssl"]
 
 # Optional usage sink (design §9.3). Off by default.
 usage-clickhouse = ["dep:clickhouse"]
