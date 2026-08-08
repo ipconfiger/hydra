@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hydra · Request Lifecycle</title>
+<style>
+/* =====================================================================
+   Hydra — Request Lifecycle visualization
+   Single self-contained file. No external deps.
+   Palette anchored on the hydra admin-ui tokens; richer stage accents
+   layered for the flow diagram. Respects prefers-reduced-motion.
+   ===================================================================== */
+
+:root {
+  /* foundations (harmonized with admin-ui) */
+  --bg:        #0b0e14;
+  --bg-1:      #0f1115;
+  --panel:     #161a23;
+  --panel-2:   #1c212d;
+  --panel-3:   #232938;
+  --border:    #2a2f3a;
+  --border-2:  #363d4d;
+  --text:      #e6e9ef;
+  --text-2:    #aab2c2;
+  --muted:     #8a93a3;
+  --faint:     #5b6473;
+
+  /* semantic */
+  --ok:   #3fb950;
+  --warn: #d29922;
+  --err:  #f85149;
+
+  /* stage accents */
+  --ingress:  #4c8dff;   /* blue   — entry */
+  --filter:   #a78bfa;   /* violet — gating */
+  --upstream: #f0b429;   /* amber  — in-flight to provider */
+  --response: #34d399;   /* green  — success */
+  --error:    #fb7185;   /* rose   — off-ramp */
+
+  --grad: linear-gradient(120deg, #4c8dff 0%, #a78bfa 55%, #34d399 120%);
+
+  --shadow: 0 18px 50px -22px rgba(0,0,0,.75);
+  --shadow-sm: 0 6px 20px -10px rgba(0,0,0,.6);
+
+  --mono: "SFMono-Regular", "JetBrains Mono", "Fira Code", ui-monospace,
+          "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+          Arial, "Apple Color Emoji", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  margin: 0;
+  font-family: var(--sans);
+  color: var(--text);
+  background: var(--bg);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+/* ---- atmospheric background layers ---- */
+.bg-layers {
+  position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: hidden;
+}
+.bg-layers::before {            /* deep base wash */
+  content: ""; position: absolute; inset: 0;
+  background:
+    radial-gradient(900px 600px at 12% -8%, rgba(76,141,255,.14), transparent 60%),
+    radial-gradient(820px 620px at 92% 4%, rgba(167,139,250,.12), transparent 62%),
+    radial-gradient(900px 700px at 70% 108%, rgba(52,211,153,.10), transparent 60%),
+    var(--bg-1);
+}
+.bg-layers::after {             /* fine grid texture */
+  content: ""; position: absolute; inset: 0;
+  background-image:
+    linear-gradient(rgba(255,255,255,.022) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.022) 1px, transparent 1px);
+  background-size: 46px 46px;
+  mask-image: radial-gradient(circle at 50% 30%, #000 0%, transparent 80%);
+}
+
+/* ---- layout shell ---- */
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 22px; }
+
+/* =====================================================================
+   HEADER
+   ===================================================================== */
+header.site {
+  padding: 64px 0 8px;
+}
+.brand { display: flex; align-items: center; gap: 16px; }
+.mark {
+  width: 52px; height: 52px; border-radius: 14px; flex: none;
+  background: var(--grad);
+  display: grid; place-items: center;
+  box-shadow: 0 10px 30px -10px rgba(76,141,255,.6), inset 0 0 0 1px rgba(255,255,255,.18);
+  position: relative;
+}
+.mark svg { width: 28px; height: 28px; }
+.brand h1 {
+  margin: 0; font-size: clamp(26px, 4vw, 38px); font-weight: 800;
+  letter-spacing: -.02em; line-height: 1;
+}
+.brand h1 .grad {
+  background: var(--grad); -webkit-background-clip: text; background-clip: text;
+  color: transparent;
+}
+.brand .tag {
+  font-family: var(--mono); font-size: 11px; color: var(--text-2);
+  border: 1px solid var(--border-2); padding: 3px 8px; border-radius: 999px;
+  background: rgba(255,255,255,.02); margin-left: 6px; vertical-align: middle;
+}
+.subtitle {
+  color: var(--text-2); font-size: clamp(15px, 2vw, 18px);
+  max-width: 62ch; margin: 18px 0 0;
+}
+.subtitle b { color: var(--text); font-weight: 600; }
+
+/* legend */
+.legend {
+  margin-top: 30px; display: flex; flex-wrap: wrap; gap: 8px 14px;
+  align-items: center;
+}
+.legend .lbl {
+  font-family: var(--mono); font-size: 11px; color: var(--faint);
+  text-transform: uppercase; letter-spacing: .12em; margin-right: 4px;
+}
+.chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--text-2);
+  border: 1px solid var(--border); background: var(--panel);
+  padding: 5px 11px; border-radius: 999px;
+}
+.chip i {
+  width: 9px; height: 9px; border-radius: 50%; display: inline-block;
+  box-shadow: 0 0 0 3px rgba(255,255,255,.04);
+}
+.chip i.c-ingress  { background: var(--ingress); }
+.chip i.c-filter   { background: var(--filter); }
+.chip i.c-upstream { background: var(--upstream); }
+.chip i.c-response { background: var(--response); }
+.chip i.c-error    { background: var(--error); }
+
+/* =====================================================================
+   FLOW
+   ===================================================================== */
+section.flow { padding: 40px 0 16px; }
+.flow-stage-label {
+  display: flex; align-items: center; gap: 12px;
+  font-family: var(--mono); font-size: 11px; color: var(--faint);
+  text-transform: uppercase; letter-spacing: .18em;
+  margin: 30px 0 14px;
+}
+.flow-stage-label::after {
+  content: ""; flex: 1; height: 1px;
+  background: linear-gradient(90deg, var(--border), transparent);
+}
+
+.flow {
+  display: flex; flex-direction: column; align-items: center;
+  max-width: 860px; margin: 0 auto;
+}
+
+/* ---- node card ---- */
+.node {
+  width: 100%; max-width: 560px;
+  background: linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,0) 80%), var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 16px 18px 16px 20px;
+  position: relative;
+  box-shadow: var(--shadow-sm);
+  transition: transform .22s ease, border-color .22s ease, box-shadow .22s ease;
+}
+.node:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-2);
+  box-shadow: var(--shadow);
+}
+/* left accent stripe, tinted by stage */
+.node::before {
+  content: ""; position: absolute; left: 0; top: 14px; bottom: 14px;
+  width: 3px; border-radius: 0 3px 3px 0;
+  background: var(--accent-c, var(--ingress));
+  box-shadow: 0 0 14px -2px var(--accent-c, var(--ingress));
+}
+.node.s-ingress  { --accent-c: var(--ingress); }
+.node.s-filter   { --accent-c: var(--filter); }
+.node.s-upstream { --accent-c: var(--upstream); }
+.node.s-response { --accent-c: var(--response); }
+
+.node .head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+.node .stage-tag {
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--accent-c);
+  border: 1px solid color-mix(in srgb, var(--accent-c) 40%, transparent);
+  background: color-mix(in srgb, var(--accent-c) 12%, transparent);
+  padding: 2px 8px; border-radius: 6px; font-weight: 600;
+}
+.node .title {
+  font-family: var(--mono); font-size: 15px; font-weight: 700; color: var(--text);
+  letter-spacing: -.01em;
+}
+.node .title.fn { color: color-mix(in srgb, var(--accent-c) 70%, var(--text)); }
+.node .desc { color: var(--text-2); font-size: 13.5px; margin: 2px 0 0; }
+.node code, .kv code, .desc code {
+  font-family: var(--mono); font-size: 12px;
+  background: rgba(255,255,255,.05); border: 1px solid var(--border);
+  padding: 1px 5px; border-radius: 5px; color: var(--text);
+}
+
+/* payload chips under ingress */
+.payload { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
+.payload .k {
+  font-family: var(--mono); font-size: 11.5px; color: var(--text-2);
+  background: rgba(76,141,255,.08); border: 1px solid rgba(76,141,255,.28);
+  padding: 3px 9px; border-radius: 7px;
+}
+.payload .k b { color: #cfe0ff; font-weight: 600; }
+
+/* ---- connectors along the happy path ---- */
+.conn {
+  width: 2px; height: 30px; position: relative; flex: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--ingress) 85%, white) 0 7px,
+    transparent 7px 14px);
+  background-size: 100% 14px;
+  animation: dash-down .7s linear infinite;
+  filter: drop-shadow(0 0 4px rgba(76,141,255,.45));
+}
+.conn::after {            /* arrowhead */
+  content: ""; position: absolute; bottom: -2px; left: 50%; transform: translateX(-50%);
+  width: 0; height: 0;
+  border: 5px solid transparent;
+  border-top: 7px solid color-mix(in srgb, var(--ingress) 85%, white);
+}
+.conn.violet {
+  background: repeating-linear-gradient(
+    to bottom, color-mix(in srgb, var(--filter) 85%, white) 0 7px, transparent 7px 14px);
+  background-size: 100% 14px;
+  filter: drop-shadow(0 0 4px rgba(167,139,250,.45));
+}
+.conn.violet::after { border-top-color: color-mix(in srgb, var(--filter) 85%, white); }
+.conn.amber {
+  background: repeating-linear-gradient(
+    to bottom, var(--upstream) 0 7px, transparent 7px 14px);
+  background-size: 100% 14px;
+  filter: drop-shadow(0 0 4px rgba(240,180,41,.4));
+}
+.conn.amber::after { border-top-color: var(--upstream); }
+.conn.green {
+  background: repeating-linear-gradient(
+    to bottom, var(--response) 0 7px, transparent 7px 14px);
+  background-size: 100% 14px;
+  filter: drop-shadow(0 0 4px rgba(52,211,153,.4));
+}
+.conn.green::after { border-top-color: var(--response); }
+
+@keyframes dash-down { to { background-position: 0 14px; } }
+
+/* =====================================================================
+   request_filter — grouped sub-steps
+   ===================================================================== */
+.group {
+  width: 100%; max-width: 760px;
+  border: 1px dashed color-mix(in srgb, var(--filter) 42%, transparent);
+  border-radius: 20px;
+  padding: 14px;
+  background:
+    radial-gradient(120% 80% at 50% 0%, rgba(167,139,250,.07), transparent 60%),
+    rgba(167,139,250,.025);
+  position: relative;
+  box-shadow: var(--shadow-sm);
+}
+.group-head {
+  display: flex; align-items: center; gap: 10px; margin: 2px 4px 12px; flex-wrap: wrap;
+}
+.group-head .badge {
+  font-family: var(--mono); font-size: 11px; font-weight: 700;
+  letter-spacing: .12em; text-transform: uppercase; color: #ede6ff;
+  background: linear-gradient(135deg, rgba(167,139,250,.28), rgba(76,141,255,.2));
+  border: 1px solid rgba(167,139,250,.45);
+  padding: 4px 10px; border-radius: 7px;
+}
+.group-head .gtitle { font-size: 13.5px; color: var(--text-2); }
+
+.steps { display: flex; flex-direction: column; gap: 9px; }
+
+.step {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 12px;
+  align-items: start;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 11px 13px;
+  transition: border-color .2s ease, transform .2s ease, background .2s ease;
+}
+.step:hover { border-color: var(--border-2); background: var(--panel-2); }
+
+.step .num {
+  width: 26px; height: 26px; border-radius: 8px; flex: none;
+  display: grid; place-items: center;
+  font-family: var(--mono); font-size: 13px; font-weight: 700; color: #fff;
+  background: linear-gradient(140deg, var(--filter), color-mix(in srgb, var(--filter) 50%, #4c8dff));
+  box-shadow: 0 4px 12px -4px rgba(167,139,250,.7);
+}
+.step .body { min-width: 0; }
+.step .stitle {
+  font-family: var(--mono); font-size: 13px; font-weight: 700; color: #efeaff;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+.step .stitle .fn { color: var(--filter); }
+.step .sdesc { color: var(--text-2); font-size: 12.5px; margin-top: 2px; }
+.step .sdesc b { color: var(--text); font-weight: 600; }
+
+/* error off-ramp inline chips inside a step */
+.err-ramp {
+  display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin-top: 7px;
+}
+.err-ramp .arrow {
+  font-family: var(--mono); color: var(--error); opacity: .9; font-size: 12px;
+}
+.code {
+  font-family: var(--mono); font-size: 11.5px; font-weight: 700;
+  color: #ffd7dd;
+  background: rgba(251,113,133,.1);
+  border: 1px solid rgba(251,113,133,.4);
+  padding: 1px 7px; border-radius: 6px;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,.2);
+}
+.code.neutral {
+  color: #ffe6b3; background: rgba(240,180,41,.1); border-color: rgba(240,180,41,.4);
+}
+.err-ramp .note { color: var(--muted); font-size: 12px; }
+
+/* =====================================================================
+   response branch (3 outcomes)
+   ===================================================================== */
+.branch {
+  width: 100%; max-width: 760px;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+}
+@media (max-width: 720px) { .branch { grid-template-columns: 1fr; } }
+
+.outcome {
+  border-radius: 14px; padding: 13px 14px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  position: relative;
+  transition: transform .2s ease, border-color .2s ease;
+}
+.outcome:hover { transform: translateY(-2px); }
+.outcome.fail    { border-color: rgba(251,113,133,.32); background: linear-gradient(180deg, rgba(251,113,133,.07), transparent 70%), var(--panel); }
+.outcome.cond    { border-color: rgba(240,180,41,.32); background: linear-gradient(180deg, rgba(240,180,41,.07), transparent 70%), var(--panel); }
+.outcome.ok      { border-color: rgba(52,211,153,.32); background: linear-gradient(180deg, rgba(52,211,153,.07), transparent 70%), var(--panel); }
+
+.outcome .otag {
+  font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: .1em;
+  text-transform: uppercase; display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 8px; border-radius: 6px;
+}
+.outcome.fail .otag { color: #ffb4bd; background: rgba(251,113,133,.14); border:1px solid rgba(251,113,133,.35); }
+.outcome.cond .otag { color: #ffe1a3; background: rgba(240,180,41,.14); border:1px solid rgba(240,180,41,.35); }
+.outcome.ok   .otag { color: #aef0cf; background: rgba(52,211,153,.14); border:1px solid rgba(52,211,153,.35); }
+
+.outcome .otitle {
+  font-family: var(--mono); font-size: 12.5px; font-weight: 700;
+  margin: 9px 0 4px; color: var(--text);
+}
+.outcome .ofn { font-family: var(--mono); color: var(--text-2); font-size: 11.5px; }
+.outcome .odesc { font-size: 12.5px; color: var(--text-2); margin-top: 6px; }
+.outcome .odesc b { color: var(--text); font-weight: 600; }
+.outcome .oftr { margin-top: 9px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+/* retry-loop annotation */
+.loop {
+  margin-top: 8px;
+  display: inline-flex; align-items: center; gap: 7px;
+  font-family: var(--mono); font-size: 11.5px; color: #ffd7dd;
+  background: rgba(251,113,133,.08);
+  border: 1px dashed rgba(251,113,133,.4);
+  padding: 4px 9px; border-radius: 8px;
+}
+.loop .spin { animation: spin 3.4s linear infinite; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.success-arrow {
+  margin-top: 10px;
+  font-family: var(--mono); font-size: 12px; color: #aef0cf;
+  display: inline-flex; align-items: center; gap: 7px;
+}
+
+/* =====================================================================
+   KEY POLICIES
+   ===================================================================== */
+section.policies { padding: 56px 0 30px; }
+.section-title {
+  font-size: clamp(22px, 3vw, 30px); font-weight: 800; letter-spacing: -.02em;
+  margin: 0 0 6px;
+}
+.section-title .grad { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.section-sub { color: var(--text-2); font-size: 14.5px; margin: 0 0 26px; }
+
+.cards {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+}
+.card {
+  background: linear-gradient(180deg, rgba(255,255,255,.03), transparent 70%), var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px; padding: 16px;
+  transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease;
+}
+.card:hover { transform: translateY(-3px); border-color: var(--border-2); box-shadow: var(--shadow); }
+.card .ic {
+  width: 36px; height: 36px; border-radius: 10px; flex: none;
+  display: grid; place-items: center; margin-bottom: 11px;
+  background: rgba(76,141,255,.1); border: 1px solid rgba(76,141,255,.3); color: #9cc2ff;
+}
+.card.c-2 .ic { background: rgba(167,139,250,.1); border-color: rgba(167,139,250,.3); color:#cdb6ff; }
+.card.c-3 .ic { background: rgba(240,180,41,.1); border-color: rgba(240,180,41,.32); color:#ffd98a; }
+.card.c-4 .ic { background: rgba(251,113,133,.1); border-color: rgba(251,113,133,.32); color:#ffabc4; }
+.card.c-5 .ic { background: rgba(63,185,80,.1); border-color: rgba(63,185,80,.32); color:#93e6a3; }
+.card.c-6 .ic { background: rgba(52,211,153,.1); border-color: rgba(52,211,153,.32); color:#7fe7bd; }
+.card.c-7 .ic { background: rgba(76,141,255,.1); border-color: rgba(76,141,255,.3); color:#9cc2ff; }
+.card.c-8 .ic { background: rgba(167,139,250,.1); border-color: rgba(167,139,250,.3); color:#cdb6ff; }
+.card .ic svg { width: 19px; height: 19px; }
+.card h3 { margin: 0 0 5px; font-size: 15px; font-weight: 700; }
+.card p { margin: 0; color: var(--text-2); font-size: 13px; line-height: 1.5; }
+.card p code {
+  font-family: var(--mono); font-size: 11.5px; background: rgba(255,255,255,.05);
+  border: 1px solid var(--border); padding: 0 5px; border-radius: 5px; color: var(--text);
+}
+
+/* footer */
+footer.site {
+  border-top: 1px solid var(--border); margin-top: 40px; padding: 26px 0 70px;
+  color: var(--faint); font-size: 12.5px;
+}
+footer.site .wrap { display: flex; flex-wrap: wrap; gap: 8px 18px; justify-content: space-between; align-items: center; }
+footer.site a { color: var(--text-2); }
+
+/* ---- entrance animation ---- */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.rise { animation: rise .6s cubic-bezier(.2,.75,.2,1) both; }
+
+/* =====================================================================
+   RESPONSIVE
+   ===================================================================== */
+@media (max-width: 720px) {
+  header.site { padding: 44px 0 4px; }
+  .node { padding: 14px 15px 14px 17px; }
+  .group { padding: 12px; }
+  .step { grid-template-columns: 24px 1fr; }
+}
+
+/* =====================================================================
+   REDUCED MOTION
+   ===================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+  .rise { opacity: 1 !important; transform: none !important; }
+}
+</style>
+</head>
+<body>
+
+<div class="bg-layers" aria-hidden="true"></div>
+
+<!-- ============================ HEADER ============================ -->
+<header class="site">
+  <div class="wrap">
+    <div class="brand rise">
+      <div class="mark" aria-hidden="true">
+        <!-- three converging routes -->
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 7c3 0 4 5 7 5s4-5 7-5" opacity=".75"/>
+          <path d="M3 12c3 0 4 5 7 5s4-5 7-5"/>
+          <path d="M3 17c3 0 4 0 7 0" opacity=".5"/>
+          <circle cx="20" cy="12" r="1.6" fill="#fff" stroke="none"/>
+        </svg>
+      </div>
+      <h1><span class="grad">Hydra</span> <span class="tag">Pingora · Rust</span></h1>
+    </div>
+    <p class="subtitle rise" style="animation-delay:.06s">
+      A high-performance <b>LLM routing gateway</b> — the runtime request-handling
+      workflow, from client ingress through gating, weighted routing, failover and
+      usage capture.
+    </p>
+
+    <div class="legend rise" style="animation-delay:.12s" aria-label="node color legend">
+      <span class="lbl">stages</span>
+      <span class="chip"><i class="c-ingress"></i>ingress</span>
+      <span class="chip"><i class="c-filter"></i>request_filter</span>
+      <span class="chip"><i class="c-upstream"></i>upstream</span>
+      <span class="chip"><i class="c-response"></i>response</span>
+      <span class="chip"><i class="c-error"></i>error exit</span>
+    </div>
+  </div>
+</header>
+
+<!-- ============================ FLOW ============================ -->
+<main>
+<section class="flow">
+  <div class="wrap">
+
+    <div class="flow-stage-label">Request lifecycle</div>
+
+    <div class="flow">
+
+      <!-- INGRESS -->
+      <div class="node s-ingress rise" style="animation-delay:.14s">
+        <div class="head">
+          <span class="stage-tag">ingress</span>
+          <span class="title">Client request</span>
+        </div>
+        <p class="desc">Arrives at the <b>Pingora ProxyService</b> carrying everything the
+          gateway needs to route and authenticate.</p>
+        <div class="payload">
+          <span class="k"><b>Host</b> · domain</span>
+          <span class="k"><b>Authorization</b> · api-key</span>
+          <span class="k"><b>body</b> · <code>model</code></span>
+        </div>
+      </div>
+
+      <div class="conn rise" style="animation-delay:.18s" aria-hidden="true"></div>
+
+      <!-- request_filter GROUP -->
+      <div class="group rise" style="animation-delay:.2s">
+        <div class="group-head">
+          <span class="badge">request_filter</span>
+          <span class="gtitle">the gating stage — every request must pass all six checks</span>
+        </div>
+
+        <div class="steps">
+
+          <!-- 1 -->
+          <div class="step">
+            <div class="num">1</div>
+            <div class="body">
+              <div class="stitle">Resolve <span class="fn">domain → tenant</span></div>
+              <div class="sdesc">Lookup by <b>Host</b>; missing / <code>localhost</code> matches the <code>localhost</code> tenant.</div>
+              <div class="err-ramp">
+                <span class="arrow">✗ not found / disabled</span>
+                <span class="code">404</span><span class="code">403</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 2 -->
+          <div class="step">
+            <div class="num">2</div>
+            <div class="body">
+              <div class="stitle">Parse <span class="fn">client api-key</span></div>
+              <div class="sdesc">Extract credential from <code>Authorization: Bearer …</code> or <code>x-api-key</code>.</div>
+            </div>
+          </div>
+
+          <!-- 3 -->
+          <div class="step">
+            <div class="num">3</div>
+            <div class="body">
+              <div class="stitle"><span class="fn">External auth</span> — AuthChecker, cache-first</div>
+              <div class="sdesc">Cache key = <b>tenant + sha256(key)</b>, <b>5-min TTL</b>. Hit → reuse verdict.
+                Miss → <code>POST tenant.auth_url</code> → 2xx cache-allow / 401·403 cache-deny.</div>
+              <div class="err-ramp">
+                <span class="arrow">✗ deny</span><span class="code">401</span>
+                <span class="arrow" style="margin-left:6px">✗ 5xx / timeout</span>
+                <span class="note">→ fail_mode:</span>
+                <span class="code">503</span><span class="note">(closed)</span>
+                <span class="code neutral">pass</span><span class="note">(open, no-cache)</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 4 -->
+          <div class="step">
+            <div class="num">4</div>
+            <div class="body">
+              <div class="stitle">Read first chunk → <span class="fn">extract model</span></div>
+              <div class="sdesc"><code>enable_retry_buffering</code> + <code>read_body_bytes</code>, then
+                <b>memchr</b> scan for <code>"model"</code> — zero-copy, <b>no full JSON parse</b>.</div>
+              <div class="err-ramp">
+                <span class="arrow">non-JSON / no model</span>
+                <span class="code neutral">passthrough</span><span class="note">(direct-connect)</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 5 -->
+          <div class="step">
+            <div class="num">5</div>
+            <div class="body">
+              <div class="stitle"><span class="fn">Route</span> — <code>router::resolve</code></div>
+              <div class="sdesc"><b>TenantModel</b> gate ∩ <b>online providers</b>(model) ∩ <b>tenant-allowed</b>;
+                drop dead / no-key / weight=0. Then <code>swrr::order</code> weighted ordering → <code>candidates[]</code>.</div>
+              <div class="err-ramp">
+                <span class="arrow">✗ empty set</span>
+                <span class="code">403</span><span class="code">503</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 6 -->
+          <div class="step">
+            <div class="num">6</div>
+            <div class="body">
+              <div class="stitle"><span class="fn">Pre-limit</span> — RateLimiter count window</div>
+              <div class="sdesc">In-memory sliding count check before any upstream work.</div>
+              <div class="err-ramp">
+                <span class="arrow">✗ over limit</span><span class="code">429</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <div class="conn violet rise" style="animation-delay:.24s" aria-hidden="true"></div>
+
+      <!-- upstream_peer -->
+      <div class="node s-upstream rise" style="animation-delay:.26s">
+        <div class="head">
+          <span class="stage-tag">upstream</span>
+          <span class="title fn">upstream_peer</span>
+        </div>
+        <p class="desc">Pick <code>candidates[cursor]</code> → <b>HttpPeer</b> (upstream TLS + SNI) with a
+          <b>random provider key</b> for this attempt.</p>
+      </div>
+
+      <div class="conn amber rise" style="animation-delay:.30s" aria-hidden="true"></div>
+
+      <!-- upstream_request_filter -->
+      <div class="node s-upstream rise" style="animation-delay:.32s">
+        <div class="head">
+          <span class="stage-tag">upstream</span>
+          <span class="title fn">upstream_request_filter</span>
+        </div>
+        <p class="desc">Swap <code>Authorization</code> = <b>provider key</b> · <code>/v1</code> path rewrite ·
+          set <code>Host</code> · inject <code>X-Hydra-Trace-Id</code>.</p>
+      </div>
+
+      <div class="conn amber rise" style="animation-delay:.36s" aria-hidden="true"></div>
+
+      <!-- request_body_filter -->
+      <div class="node s-upstream rise" style="animation-delay:.38s">
+        <div class="head">
+          <span class="stage-tag">upstream</span>
+          <span class="title fn">request_body_filter</span>
+        </div>
+        <p class="desc">Accumulate <code>Vec&lt;Bytes&gt;</code> for failover replay
+          (<code>Bytes::clone</code> is <b>O(1)</b>) and forward the body unmodified.</p>
+      </div>
+
+      <div class="conn amber rise" style="animation-delay:.42s" aria-hidden="true"></div>
+
+      <!-- upstream response branch -->
+      <div class="node s-response rise" style="animation-delay:.44s; max-width:760px;">
+        <div class="head">
+          <span class="stage-tag">response</span>
+          <span class="title fn">Upstream response — branch</span>
+        </div>
+        <p class="desc" style="margin-bottom:14px">The proxy outcome decides what happens next.</p>
+
+        <div class="branch">
+
+          <!-- connect failure -->
+          <div class="outcome fail">
+            <span class="otag">✗ connect failure</span>
+            <div class="otitle">fail_to_connect</div>
+            <div class="ofn">→ breaker.on_failure</div>
+            <div class="odesc"><b>cursor++</b>; if more candidates remain → <b>set_retry</b> back to <code>upstream_peer</code>.</div>
+            <div class="oftr">
+              <span class="loop"><span class="spin">↻</span> retry next candidate</span>
+            </div>
+            <div class="oftr"><span class="arrow" style="color:var(--error)">all exhausted</span><span class="code">502</span></div>
+          </div>
+
+          <!-- mid-proxy error -->
+          <div class="outcome cond">
+            <span class="otag">! mid-proxy error</span>
+            <div class="otitle">error_while_proxy</div>
+            <div class="ofn">→ conditional retry</div>
+            <div class="odesc">Only if <code>retry_after_connect</code> <b>(default false)</b>
+              &amp;&amp; <code>bytes_seen==0</code> &amp;&amp; <code>body_replayable</code> &amp;&amp; more candidates.</div>
+            <div class="oftr"><span class="note" style="color:var(--text-2)">avoids double-billing</span></div>
+          </div>
+
+          <!-- success -->
+          <div class="outcome ok">
+            <span class="otag">✓ success · 2xx first byte</span>
+            <div class="otitle">response_body_filter</div>
+            <div class="ofn">→ memchr scan <code>"usage"</code></div>
+            <div class="odesc">Deserialize <b>~50 B</b> only on hit; pass all chunks through unmodified.</div>
+            <div class="oftr">
+              <span class="code neutral">logging</span>
+              <span class="note" style="color:var(--text-2)">UsageSink · Prometheus · breaker.on_success</span>
+            </div>
+            <div class="success-arrow">↓ streamed back to client ✓</div>
+          </div>
+
+        </div>
+      </div>
+
+      <div class="conn green rise" style="animation-delay:.48s" aria-hidden="true"></div>
+
+      <!-- terminal -->
+      <div class="node s-response rise" style="animation-delay:.50s; max-width:420px; text-align:center">
+        <div class="head" style="justify-content:center">
+          <span class="stage-tag">response</span>
+          <span class="title">Response delivered</span>
+        </div>
+        <p class="desc" style="margin:0">Body streamed to client · usage recorded · circuit breaker healed.</p>
+      </div>
+
+    </div><!-- /.flow -->
+
+  </div>
+</section>
+
+<!-- ============================ KEY POLICIES ============================ -->
+<section class="policies">
+  <div class="wrap">
+    <h2 class="section-title"><span class="grad">Key policies</span></h2>
+    <p class="section-sub">The guarantees and trade-offs encoded across the pipeline.</p>
+
+    <div class="cards">
+
+      <div class="card c-1">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v7c0 5 3.5 8 8 10 4.5-2 8-5 8-10V5l-8-3Z"/><path d="M9 12l2 2 4-4"/></svg></div>
+        <h3>Auth</h3>
+        <p>Cache-first, <b>5-min TTL</b>. Denials cached with a short TTL.
+          <code>DELETE /api/v1/auth/cache</code> forces re-auth on next request.</p>
+      </div>
+
+      <div class="card c-2">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7.5 7.5 11 16M16.5 7.5 13 16M8 6h8"/></svg></div>
+        <h3>Routing</h3>
+        <p>model ∩ TenantModel-gate ∩ online providers ∩ tenant-allowed.
+          <b>Nginx SWRR</b> weighted round-robin orders the candidates.</p>
+      </div>
+
+      <div class="card c-3">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v4h-4"/></svg></div>
+        <h3>Failover</h3>
+        <p>Connect failure <b>always</b> retries the next candidate.
+          Mid-proxy defaults to <b>no retry</b> (<code>retry_after_connect=false</code>) — prevents duplicate billing.</p>
+      </div>
+
+      <div class="card c-4">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/></svg></div>
+        <h3>Circuit breaker</h3>
+        <p><b>N consecutive failures</b> → provider enters dead-set and is skipped.
+          A background probe revives it once it heals.</p>
+      </div>
+
+      <div class="card c-5">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12a7 7 0 0 1 14 0"/><path d="M2 12h2M20 12h2M12 2v2M5 5l1.5 1.5M19 5l-1.5 1.5"/><path d="M12 12l4-2"/></svg></div>
+        <h3>Rate limit</h3>
+        <p>In-memory <b>sliding window</b> — count pre-flight + tokens post-flight,
+          across <code>m / h / d</code> windows.</p>
+      </div>
+
+      <div class="card c-6">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="13" height="10" rx="2"/><path d="M16 10h3l2 3v2h-5"/><circle cx="7" cy="18" r="1.6"/><circle cx="17" cy="18" r="1.6"/></svg></div>
+        <h3>Zero-copy</h3>
+        <p>Body flows <b>untouched</b>. <code>model</code> / <code>usage</code> found by
+          <b>memchr</b> scan only; first chunk replayed via <code>enable_retry_buffering</code>.</p>
+      </div>
+
+      <div class="card c-7">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V5"/><path d="M4 19h16"/><rect x="7" y="11" width="3" height="6"/><rect x="12" y="7" width="3" height="10"/><rect x="17" y="13" width="3" height="4"/></svg></div>
+        <h3>Usage</h3>
+        <p>Tokens parsed from the <b>SSE tail</b> (OpenAI / Anthropic multi-schema) →
+          <b>SQLite</b> (or ClickHouse) for analytics and billing.</p>
+      </div>
+
+      <div class="card c-8">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15" r="1.4"/></svg></div>
+        <h3>TLS</h3>
+        <p><b>SNI-based</b> per-tenant certificate (BoringSSL callback) with
+          <b>hot-reload</b> — no restart needed to rotate certs.</p>
+      </div>
+
+    </div>
+  </div>
+</section>
+</main>
+
+<footer class="site">
+  <div class="wrap">
+    <span>Hydra · request-handling workflow · single-file diagram</span>
+    <span><code style="font-family:var(--mono)">Pingora · Rust · BoringSSL</code></span>
+  </div>
+</footer>
+
+<script>
+/* Progressive enhancement only — keep the diagram fully functional without JS.
+   Pause the animated flow lines when the flow is off-screen (saves cycles),
+   and gate everything behind prefers-reduced-motion. */
+(function () {
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+  var lines = document.querySelectorAll('.conn');
+  if (!('IntersectionObserver' in window) || !lines.length) return;
+
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      e.target.style.animationPlayState = e.isIntersecting ? 'running' : 'paused';
+    });
+  }, { rootMargin: '60px' });
+
+  lines.forEach(function (l) { io.observe(l); });
+})();
+</script>
+
+</body>
+</html>
