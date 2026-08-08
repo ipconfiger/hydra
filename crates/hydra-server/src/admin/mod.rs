@@ -1,13 +1,17 @@
 //! `AdminService` — a Pingora `ServeHttp` app exposing the management REST API
-//! + self-hosted `/metrics` (design §13, §17). Runs as a second `Service` on its
-//! own plain-TCP port (`[admin] addr`), sharing the same Tokio runtime as the
-//! proxy (design §13.1 — no axum, no second runtime).
+//! + self-hosted `/metrics` (design §13, §17) and the embedded `/admin/*` UI
+//! (design §14). Runs as a second `Service` on its own plain-TCP port
+//! (`[admin] addr`), sharing the same Tokio runtime as the proxy (design §13.1
+//! — no axum, no second runtime).
 //!
 //! ## Architecture
 //!
 //! - **Lightweight router**: method + path-segment match, no framework. All
 //!   `/api/v1/*` routes are admin-token-gated (design §13.3); `/metrics` is
-//!   served from the prometheus default registry.
+//!   served from the prometheus default registry; `/admin/*` serves the
+//!   embedded static UI **without** the token gate (the HTML/CSS/JS have no
+//!   secrets — `app.js` collects the admin token and attaches
+//!   `Authorization: Bearer` on every `/api/v1/*` fetch).
 //! - **No internal mocking**: every handler drives the real `db::repo`,
 //!   `ConfigStore`, `AuthChecker`, `CircuitBreaker` and `HydraCertStore`.
 //! - **Write-after consistency**: every successful config write calls
@@ -29,6 +33,7 @@ use crate::store::ConfigStore;
 
 pub mod handlers;
 pub mod metrics;
+mod static_files;
 
 // Re-export the metrics module publicly so the proxy / breaker / tls can reach
 // the `record_*` call-sites and the `/metrics` renderer.
@@ -224,6 +229,16 @@ impl ServeHttp for AdminService {
         let method = session.req_header().method.as_str().to_string();
         let path = session.req_header().uri.path().to_string();
         let query = session.req_header().uri.query().map(str::to_string);
+
+        // Embedded UI (design §14): serve `/admin/*` WITHOUT the admin token
+        // gate. The static HTML/CSS/JS contain no secrets; `app.js` collects
+        // the admin token in-memory and attaches `Authorization: Bearer` to
+        // every `/api/v1/*` fetch. Only GET is allowed for the UI.
+        if method == "GET" {
+            if let Some(resp) = static_files::try_serve_admin(&path) {
+                return resp;
+            }
+        }
 
         // Admin-token gate (design §13.3) — every request to the admin port.
         if !self.check_auth(session) {
