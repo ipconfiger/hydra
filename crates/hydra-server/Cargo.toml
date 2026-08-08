@@ -12,18 +12,23 @@ description = "Hydra I/O shell — Pingora proxy, sqlx store, reqwest auth. Thin
 [features]
 default = []
 
-# Collects the heavy / native I/O dependencies. It is OFF by default so the
-# foundation stays green (`cargo build --all` compiles the pure core + this
-# empty lib) without compiling pingora/sqlx/reqwest. W4 flips it on when wiring
-# the binary; the dep *versions & features* are fully pinned here so W2–W5
-# never need to edit this manifest.
-server = [
-    "dep:pingora",
-    "dep:pingora-proxy",
-    "dep:pingora-core",
+# Granular, composable feature set so each wave can compile its slice of the
+# I/O shell WITHOUT pulling unrelated native deps (e.g. W2/W3 must build with
+# only sqlx/reqwest and never touch pingora/BoringSSL on macOS).
+#
+# `dep:` syntax is used so enabling a feature does NOT auto-activate the dep
+# under the same name (feature/dep decoupling).
+#
+# - `runtime`    : shared async-runtime helpers (tokio, dashmap, arc-swap,
+#                  tracing, prometheus, thiserror, chrono, include_dir).
+#                  Required by every I/O module.
+# - `db`         : sqlx pool / migrations / repo (W2).
+# - `http-client`: reqwest auth upstream (W3).
+# - `proxy`      : pingora proxy shell + TLS (W4) — pulls BoringSSL.
+# - `server`     : umbrella for full/W4+ builds (= db + http-client + proxy).
+# - `usage-clickhouse`: optional ClickHouse usage sink (design §9.3).
+runtime = [
     "dep:tokio",
-    "dep:sqlx",
-    "dep:reqwest",
     "dep:dashmap",
     "dep:arc-swap",
     "dep:tracing",
@@ -33,6 +38,10 @@ server = [
     "dep:chrono",
     "dep:include_dir",
 ]
+db = ["runtime", "dep:sqlx"]
+http-client = ["runtime", "dep:reqwest"]
+proxy = ["runtime", "dep:pingora", "dep:pingora-proxy", "dep:pingora-core"]
+server = ["db", "http-client", "proxy"]
 
 # Optional usage sink (design §9.3). Off by default.
 usage-clickhouse = ["dep:clickhouse"]

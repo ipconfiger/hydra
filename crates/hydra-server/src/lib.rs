@@ -5,13 +5,53 @@
 //! All "internal logic" lives in the pure core; this crate only translates
 //! between I/O (sessions / rows / responses) and core types.
 //!
-//! **Status:** Wave-1 foundation skeleton — empty by design. Waves 2–6 fill in
-//! the modules below; the `server` feature (gating pingora/sqlx/reqwest) and
-//! the binary target are enabled in W4.
+//! **Status:** Wave-1 foundation skeleton — modules are feature-gated and
+//! intentionally empty. Waves 2–6 fill them in.
 //!
-//! Planned modules (per design §3):
-//! - `proxy` — `ProxyHttp` impl wiring core fns to Pingora hooks
-//! - `store` — sqlx repo + `ConfigStore` (`ArcSwap<ConfigData>`) + loader
-//! - `http` — `HttpAuthChecker` (reqwest) + admin `ServeHttp`
-//! - `sink` — `SqliteSink` / `ClickHouseSink`
-//! - `tls` — `certificate_callback` over the core `certs` map
+//! ## Feature model
+//!
+//! The crate is split into composable Cargo features so each wave compiles
+//! only the slice of the I/O shell it needs (see `Cargo.toml` `[features]`):
+//!
+//! | Feature        | Module(s)        | Wave  | Native dep        |
+//! | -------------- | ---------------- | ----- | ----------------- |
+//! | `runtime`      | `sink`, `admin`  | W3/W5 | tokio/dashmap/... |
+//! | `db`           | `db`, `store`    | W2    | sqlx (sqlite)     |
+//! | `http-client`  | `http`           | W3    | reqwest (rustls)  |
+//! | `proxy`        | `proxy`, `tls`   | W4    | pingora/BoringSSL |
+//! | `server`       | (umbrella)       | W4+   | all of the above  |
+//! | `usage-clickhouse` | (within sink) | W3  | clickhouse (opt)  |
+//!
+//! With no features the crate is an empty lib; `db,http-client` builds sqlx +
+//! reqwest/rustls **without** pingora/BoringSSL, letting W2/W3 run natively
+//! on macOS.
+#![forbid(unsafe_code)]
+
+// --- W2: persistence & config store ---------------------------------------
+/// sqlx pool, migrations, and the repo layer.
+#[cfg(feature = "db")]
+pub mod db;
+/// `ConfigStore` — `ArcSwap<ConfigData>` hot-reload shell over the DB.
+#[cfg(feature = "db")]
+pub mod store;
+
+// --- W3: external boundaries ----------------------------------------------
+/// `HttpAuthChecker` (reqwest) + admin `ServeHttp` HTTP helpers.
+#[cfg(feature = "http-client")]
+pub mod http;
+/// `UsageSink` trait + `SqliteSink` / `ClickHouseSink` adapters.
+#[cfg(feature = "runtime")]
+pub mod sink;
+
+// --- W4: Pingora proxy shell ----------------------------------------------
+/// `ProxyHttp` impl wiring core fns to Pingora hooks.
+#[cfg(feature = "proxy")]
+pub mod proxy;
+/// `HydraCertStore` — multi-tenant dynamic SNI certificate callback.
+#[cfg(feature = "proxy")]
+pub mod tls;
+
+// --- W5: admin service & observability ------------------------------------
+/// `ServeHttp` admin REST API + self-hosted metrics.
+#[cfg(feature = "runtime")]
+pub mod admin;
