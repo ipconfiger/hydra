@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build workspace
+        run: cargo build --all
+
+      # T1.1 / T1.2 / T10.1 (mirror) / T10.2 — the pure-core suite, incl. the
+      # in-process dependency-firewall test.
+      - name: Test hydra-core (pure)
+        run: cargo test -p hydra-core
+
+      # T10.1 — authoritative dependency firewall. Asserts `hydra-core`'s
+      # resolved tree contains NONE of tokio/pingora/sqlx/reqwest/hyper
+      # (memchr/bytes/sha2 are pure and allowed). `grep -E ...` exits non-zero
+      # (and fails the step) if any forbidden crate name appears.
+      - name: Dependency firewall (hydra-core has zero I/O deps)
+        run: |
+          set -euo pipefail
+          tree="$(cargo tree -p hydra-core --no-default-features)"
+          echo "$tree"
+          if echo "$tree" | grep -E ' (tokio|pingora|sqlx|reqwest|hyper)(-[^ ]+)? v'; then
+            echo "::error::hydra-core pulls a forbidden I/O dependency (see tree above)"
+            exit 1
+          fi
+          echo "OK: hydra-core has no I/O dependencies."
+
+      # The full server suite runs only with the `server` feature (W4+); gated
+      # here so the foundation stays green until the shell exists.
+      - name: Test hydra-server (shell, when implemented)
+        run: cargo test -p hydra-server
+        continue-on-error: true

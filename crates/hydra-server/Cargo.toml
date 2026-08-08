@@ -1,0 +1,65 @@
+[package]
+name = "hydra-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hydra I/O shell — Pingora proxy, sqlx store, reqwest auth. Thin adapter over hydra-core."
+
+# The crate is a library now; the binary is added in W4 (design §3 / wave-1).
+# `src/lib.rs` is intentionally a doc-only skeleton that W2–W6 fill in.
+
+[features]
+default = []
+
+# Collects the heavy / native I/O dependencies. It is OFF by default so the
+# foundation stays green (`cargo build --all` compiles the pure core + this
+# empty lib) without compiling pingora/sqlx/reqwest. W4 flips it on when wiring
+# the binary; the dep *versions & features* are fully pinned here so W2–W5
+# never need to edit this manifest.
+server = [
+    "dep:pingora",
+    "dep:pingora-proxy",
+    "dep:pingora-core",
+    "dep:tokio",
+    "dep:sqlx",
+    "dep:reqwest",
+    "dep:dashmap",
+    "dep:arc-swap",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:prometheus",
+    "dep:thiserror",
+    "dep:chrono",
+    "dep:include_dir",
+]
+
+# Optional usage sink (design §9.3). Off by default.
+usage-clickhouse = ["dep:clickhouse"]
+
+[dependencies]
+# Always link the pure core.
+hydra-core = { path = "../hydra-core" }
+
+# --- Server runtime (gated behind `server`) -------------------------------
+pingora = { version = "0.8", optional = true }
+pingora-proxy = { version = "0.8", optional = true }
+pingora-core = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+dashmap = { version = "6", optional = true }
+arc-swap = { version = "1", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.1", optional = true }
+prometheus = { version = "0.13", optional = true }
+thiserror = { version = "1", optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+include_dir = { version = "0.7", optional = true }
+
+# --- Optional sink --------------------------------------------------------
+clickhouse = { version = "0.1", optional = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio-test = "0.4"
