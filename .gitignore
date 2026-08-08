@@ -8,12 +8,26 @@
 # Local SQLite data directory (created at runtime by hydra-server)
 /data
 
+# Cross-compiled Linux binary staged for Docker (built by environment/build.sh)
+/bin/
+
 # Editor / OS cruft
 .DS_Store
 .idea/
 .vscode/
 
-# BEGIN oh-my-opencode-slim worktrees
-.slim/worktrees/
-.slim/worktrees.json
-# END oh-my-opencode-slim worktrees
+# AI agent / tool local state (never commit)
+.claude/
+.opencode/
+.agents/
+.cursor/
+.aider*
+.continue/
+.codeium/
+.windsurf/
+# BEGIN oh-my-opencode-slim (worktrees + local state)
+.slim/
+# END oh-my-opencode-slim
+
+# Secrets / certs / sensitive material (never commit)
+/secure/

@@ -1,0 +1,22 @@
+# Build context is the repo root (docker build -f environment/Dockerfile .).
+# Exclude everything not needed for the image to keep the context small + cache-friendly.
+**/.git
+**/target
+**/.slim
+**/docs
+**/tests
+**/admin-ui
+**/*.rs
+**/Cargo.toml
+**/Cargo.lock
+**/.github
+**/.idea
+**/.vscode
+**/*.md
+**/.gitignore
+**/.ignore
+**/node_modules
+
+# KEEP the staged binary (build.sh writes it here):
+!bin/
+!bin/hydra
