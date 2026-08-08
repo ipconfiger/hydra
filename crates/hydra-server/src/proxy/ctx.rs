@@ -68,6 +68,9 @@ pub struct RequestContext {
     /// Upstream response bytes seen so far (gates `error_while_proxy` retry —
     /// once > 0 we never retry to avoid duplicate streams, §8.2/§8.3).
     pub upstream_bytes_seen: u64,
+    /// Instant the upstream peer was selected (set in `upstream_peer`) — used to
+    /// observe `hydra_upstream_duration_seconds` (time to first response byte).
+    pub upstream_started_at: Option<Instant>,
     /// Status code received from the upstream (for the usage record).
     pub status_code: u16,
     /// Upstream host actually contacted (for the usage record).
@@ -103,6 +106,7 @@ impl RequestContext {
             body_too_large: false,
             hard_capped: false,
             upstream_bytes_seen: 0,
+            upstream_started_at: None,
             status_code: 0,
             upstream_host: None,
             // Generic (OpenAI-compatible) schema by default; the shell does not

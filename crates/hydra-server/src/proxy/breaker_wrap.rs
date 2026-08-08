@@ -61,6 +61,9 @@ impl CircuitBreaker {
         if count >= self.threshold {
             if !self.dead.contains(provider_id) {
                 self.dead.insert(provider_id.to_string());
+                // Metrics (§17): breaker just went dead.
+                crate::admin::metrics::record_breaker_dead(provider_id, 1);
+                crate::admin::metrics::record_breaker_transition(provider_id, "dead");
                 warn!(
                     provider = provider_id,
                     consecutive_failures = count,
@@ -84,6 +87,9 @@ impl CircuitBreaker {
     pub fn on_success(&self, provider_id: &str) {
         self.fails.remove(provider_id);
         if self.dead.remove(provider_id).is_some() {
+            // Metrics (§17): breaker just revived.
+            crate::admin::metrics::record_breaker_dead(provider_id, 0);
+            crate::admin::metrics::record_breaker_transition(provider_id, "alive");
             info!(
                 provider = provider_id,
                 "circuit breaker CLOSED (provider revived)"

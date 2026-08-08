@@ -55,6 +55,10 @@ pub mod proxy;
 pub mod tls;
 
 // --- W5: admin service & observability ------------------------------------
-/// `ServeHttp` admin REST API + self-hosted metrics.
-#[cfg(feature = "runtime")]
+/// `ServeHttp` admin REST API + self-hosted metrics. Depends on the proxy shell
+/// (`CircuitBreaker`, `new_trace_id`), the config store + repo (`db`) and the
+/// auth checker (`http-client`), so it is gated on `proxy` (which since W5
+/// implies `db` + `http-client`); the `metrics` sub-module is reached by the
+/// proxy / breaker / tls `record_*` call-sites.
+#[cfg(feature = "proxy")]
 pub mod admin;
