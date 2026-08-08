@@ -6,8 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "Hydra I/O shell — Pingora proxy, sqlx store, reqwest auth. Thin adapter over hydra-core."
 
-# The crate is a library now; the binary is added in W4 (design §3 / wave-1).
-# `src/lib.rs` is intentionally a doc-only skeleton that W2–W6 fill in.
+# W4: the `hydra` binary bootstraps the Pingora proxy server (design §15.1).
+[[bin]]
+name = "hydra"
+path = "src/main.rs"
+required-features = ["server"]
 
 [features]
 default = []
@@ -40,7 +43,7 @@ runtime = [
 ]
 db = ["runtime", "dep:sqlx"]
 http-client = ["runtime", "dep:reqwest"]
-proxy = ["runtime", "dep:pingora", "dep:pingora-proxy", "dep:pingora-core"]
+proxy = ["runtime", "dep:pingora", "dep:pingora-proxy", "dep:pingora-core", "dep:pingora-http", "dep:rand", "dep:async-trait", "dep:bytes", "dep:http"]
 server = ["db", "http-client", "proxy"]
 
 # Optional usage sink (design §9.3). Off by default.
@@ -54,6 +57,11 @@ hydra-core = { path = "../hydra-core" }
 pingora = { version = "0.8", optional = true }
 pingora-proxy = { version = "0.8", optional = true }
 pingora-core = { version = "0.8", optional = true }
+pingora-http = { version = "0.8", optional = true }
+rand = { version = "0.8", optional = true }
+async-trait = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
