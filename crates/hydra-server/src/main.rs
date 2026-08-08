@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use hydra_core::breaker::BreakerConfig;
+use hydra_server::admin::{AdminService, AdminState};
 use hydra_server::db;
 use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::{spawn_probe_task, CircuitBreaker};
@@ -35,6 +36,7 @@ use tracing::{error, info};
 
 const DEFAULT_DB_URL: &str = "sqlite:hydra.db?mode=rwc";
 const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
+const DEFAULT_ADMIN_LISTEN: &str = "127.0.0.1:8081";
 const DEFAULT_USAGE_SINK: &str = "sqlite";
 
 #[tokio::main]
@@ -125,15 +127,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // (8a) Downstream TLS when any tenant has certs (design §12 / W4b); else
     //      plain TCP for the localhost/dev case. The cfg split keeps the binary
-    //      buildable without a TLS backend (plain `proxy` feature).
+    //      buildable without a TLS backend (plain `proxy` feature). Under a TLS
+    //      backend the resolved `HydraCertStore` is kept so the admin reload
+    //      endpoint can re-resolve certs (W4b contract).
     #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
-    let tls_enabled = {
+    let (tls_enabled, cert_store) = {
         use hydra_server::tls::HydraCertStore;
 
         let snapshot = store.snapshot();
         if snapshot.certs.is_empty() {
             proxy_service.add_tcp(&listen_addr);
-            false
+            (false, None::<HydraCertStore>)
         } else {
             // Resolve CertMeta → parsed certs into the shared ArcSwap (§12.1
             // single source). The box inside TlsSettings shares this same
@@ -144,12 +148,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             match cert_store.build_tls_settings() {
                 Ok(settings) => {
                     proxy_service.add_tls_with_settings(&listen_addr, None, settings);
-                    true
+                    (true, Some(cert_store))
                 }
                 Err(e) => {
                     error!(error = %e, "failed to build TLS settings; falling back to plain TCP");
                     proxy_service.add_tcp(&listen_addr);
-                    false
+                    (false, None)
                 }
             }
         }
@@ -167,5 +171,48 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         info!(listen = %listen_addr, "proxy plain-TCP listener bound (no tenant certs configured)");
     }
+
+    // (9) Admin service — a second Pingora `Service` (ServeHttp) on its own
+    //     plain-TCP port (design §13.1). Same runtime, admin-token-gated.
+    let admin_token = AdminService::token_from_env();
+    let admin_addr =
+        std::env::var("HYDRA_ADMIN_ADDR").unwrap_or_else(|_| DEFAULT_ADMIN_LISTEN.to_string());
+
+    // Cert-reload hook for the W4b contract: re-resolve certs from the latest
+    // snapshot after every reload. Only meaningful under a TLS backend.
+    #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
+    let cert_reloader: Option<Arc<dyn Fn() + Send + Sync>> = cert_store.as_ref().map(|cs| {
+        let cs = cs.clone();
+        let store = store.clone();
+        Arc::new(move || {
+            let snap = store.snapshot();
+            cs.resolve_and_store(&snap.certs);
+        }) as Arc<dyn Fn() + Send + Sync>
+    });
+    #[cfg(not(any(feature = "tls-boringssl", feature = "tls-openssl")))]
+    let cert_reloader: Option<Arc<dyn Fn() + Send + Sync>> = None;
+
+    let admin_state = Arc::new(AdminState::new(
+        pool.clone(),
+        store.clone(),
+        auth.clone(),
+        breaker.clone(),
+        admin_token.clone(),
+        cert_reloader,
+    ));
+    let admin_app = AdminService::new(admin_state);
+    let mut admin_service =
+        pingora_core::services::listening::Service::new("Hydra admin API".to_string(), admin_app);
+    admin_service.add_tcp(&admin_addr);
+    server.add_service(admin_service);
+    if admin_token.is_some() {
+        info!(admin = %admin_addr, "admin REST API bound (admin token configured)");
+    } else {
+        error!(
+            admin = %admin_addr,
+            "admin REST API bound but HYDRA_ADMIN_TOKEN is unset — all admin requests will be denied (§13.3)"
+        );
+    }
+
     server.run_forever();
 }

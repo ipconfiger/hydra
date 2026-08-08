@@ -214,6 +214,30 @@ impl ProxyHttp for HydraProxy {
         // (4) External auth (§6.3 §4 / §11). Cache-first via AuthChecker.
         let verdict = self.state.auth.check(&tenant, &api_key).await;
         ctx.auth_verdict = Some(verdict.clone());
+        // Metrics (§17): auth decision + cache size (+ upstream-error counter).
+        {
+            use hydra_core::auth::{AuthVerdict, CacheSource};
+            let src = match &verdict {
+                AuthVerdict::Allowed { source } | AuthVerdict::Denied { source, .. } => {
+                    match source {
+                        CacheSource::Hit => "hit",
+                        CacheSource::Miss => "miss",
+                        CacheSource::Local => "local",
+                    }
+                }
+            };
+            let vlabel = match &verdict {
+                AuthVerdict::Allowed { .. } => "allowed",
+                AuthVerdict::Denied { .. } => "denied",
+            };
+            crate::admin::metrics::record_auth_decision(&tenant_id, vlabel, src);
+            crate::admin::metrics::record_auth_cache_size(self.state.auth.cache().len());
+            if let AuthVerdict::Denied { reason, .. } = &verdict {
+                if *reason == "auth_upstream_unavailable" {
+                    crate::admin::metrics::record_auth_upstream_error(&tenant_id);
+                }
+            }
+        }
         if let AuthVerdict::Denied { status, reason, .. } = &verdict {
             let body = Bytes::from(format!(
                 "{{\"error\":{{\"message\":\"{reason}\",\"type\":\"auth_error\"}}}}"
@@ -292,6 +316,7 @@ impl ProxyHttp for HydraProxy {
                     ctx.route_error = Some(e);
                     let status = route_error_status(e);
                     let reason = route_error_reason(e);
+                    crate::admin::metrics::record_route_error(&tenant_id, reason);
                     return short_circuit(session, status, reason).await;
                 }
             };
@@ -319,6 +344,7 @@ impl ProxyHttp for HydraProxy {
                 .check_count(&cfg.limit_roles, &match_ctx, now)
         {
             debug!(role = %role_id, tenant = %tenant_id, "rate-limited (count)");
+            crate::admin::metrics::record_limit_rejected(&tenant_id, &role_id, "count");
             return short_circuit(session, 429, "rate_limited").await;
         }
 
@@ -368,6 +394,9 @@ impl ProxyHttp for HydraProxy {
             upstream_api_key: key.clone(),
         });
         ctx.upstream_host = Some(endpoint.host.clone());
+        // Mark when we hand off to the upstream so the first response byte can
+        // observe `hydra_upstream_duration_seconds` (§17).
+        ctx.upstream_started_at = Some(Instant::now());
         Ok(Box::new(build_peer(&endpoint)))
     }
 
@@ -467,6 +496,15 @@ impl ProxyHttp for HydraProxy {
         upstream_response.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
         // Record the status code for the usage record.
         ctx.status_code = upstream_response.status.as_u16();
+        // Metrics (§17): upstream time-to-first-byte, if a start was captured.
+        if let (Some(start), Some(pid), Some(model)) = (
+            ctx.upstream_started_at,
+            ctx.selected.as_ref().map(|s| s.provider_id.as_str()),
+            ctx.model_key.as_deref(),
+        ) {
+            let elapsed = start.elapsed().as_secs_f64();
+            crate::admin::metrics::record_upstream_duration(pid, model, elapsed);
+        }
         // On a 2xx first byte, mark success for the breaker (§6.6).
         if ctx.status_code >= 200 && ctx.status_code < 300 {
             if let Some(pid) = ctx.current_provider_id().map(str::to_string) {
@@ -512,6 +550,9 @@ impl ProxyHttp for HydraProxy {
         if more {
             ctx.cursor += 1;
             e.set_retry(true);
+            if let (Some(t), Some(m)) = (ctx.tenant.as_ref(), ctx.model_key.as_deref()) {
+                crate::admin::metrics::record_retry(&t.id, m, "connect");
+            }
             info!(
                 cursor = ctx.cursor,
                 attempts = ctx.candidates.len(),
@@ -547,6 +588,9 @@ impl ProxyHttp for HydraProxy {
         if cfg.retry_after_connect && first_byte_not_seen && body_replayable && more {
             ctx.cursor += 1;
             e.set_retry(true);
+            if let (Some(t), Some(m)) = (ctx.tenant.as_ref(), ctx.model_key.as_deref()) {
+                crate::admin::metrics::record_retry(&t.id, m, "proxy");
+            }
             warn!(
                 cursor = ctx.cursor,
                 "error_while_proxy: opt-in retry to next candidate (may double-bill)"
@@ -586,6 +630,39 @@ impl ProxyHttp for HydraProxy {
         )
         .finalize();
         ctx.usage = usage.clone();
+
+        // Metrics (§17): request counter + latency histogram + token usage.
+        // Increment for every proxied request that selected a provider.
+        if let (Some(tenant), Some(sel)) = (ctx.tenant.as_ref(), ctx.selected.as_ref()) {
+            let model = ctx.model_key.clone().unwrap_or_default();
+            crate::admin::metrics::record_request(&tenant.id, &sel.provider_id, &model, status);
+            crate::admin::metrics::record_request_duration(
+                &tenant.id,
+                &sel.provider_id,
+                &model,
+                ctx.started_at.elapsed().as_secs_f64(),
+            );
+            if let Some(u) = usage.as_ref() {
+                if let Some(p) = u.prompt_tokens {
+                    crate::admin::metrics::record_tokens(
+                        &tenant.id,
+                        &sel.provider_id,
+                        &model,
+                        "prompt",
+                        p,
+                    );
+                }
+                if let Some(c) = u.completion_tokens {
+                    crate::admin::metrics::record_tokens(
+                        &tenant.id,
+                        &sel.provider_id,
+                        &model,
+                        "completion",
+                        c,
+                    );
+                }
+            }
+        }
 
         // Record into the sink (fire-and-forget). Only when we actually
         // selected a provider (i.e. forwarded something).

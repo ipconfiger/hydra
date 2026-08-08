@@ -49,10 +49,32 @@ runtime = [
     "dep:thiserror",
     "dep:chrono",
     "dep:include_dir",
+    # W5 admin REST API: JSON (de)serialisation + the async-trait/http types
+    # required to impl pingora's `ServeHttp`. Pulled into `runtime` so the
+    # admin module (and its metric call-sites in the proxy) always have them.
+    "dep:async-trait",
+    "dep:http",
+    "dep:serde",
+    "dep:serde_json",
 ]
 db = ["runtime", "dep:sqlx"]
 http-client = ["runtime", "dep:reqwest"]
-proxy = ["runtime", "dep:pingora", "dep:pingora-proxy", "dep:pingora-core", "dep:pingora-http", "dep:rand", "dep:async-trait", "dep:bytes", "dep:http"]
+# `proxy` now implies `db` + `http-client`: the proxy shell uses ConfigStore
+# (W2) and reqwest (W3 auth upstream + W4 breaker probe), so `--features proxy`
+# must build standalone (W4b follow-up). TLS backends below still imply `proxy`.
+proxy = [
+    "runtime",
+    "db",
+    "http-client",
+    "dep:pingora",
+    "dep:pingora-proxy",
+    "dep:pingora-core",
+    "dep:pingora-http",
+    "dep:rand",
+    "dep:async-trait",
+    "dep:bytes",
+    "dep:http",
+]
 # Downstream TLS backends (design §12.1). Exactly one should be combined with
 # `proxy`/`server`. Both imply `proxy` (the shell) and forward the matching
 # backend feature to every pingora crate so the same TLS impl is linked
@@ -88,6 +110,9 @@ prometheus = { version = "0.13", optional = true }
 thiserror = { version = "1", optional = true }
 chrono = { version = "0.4", features = ["serde"], optional = true }
 include_dir = { version = "0.7", optional = true }
+# W5 admin REST API (design §13): JSON encode/decode for entities + own types.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 # --- Optional sink --------------------------------------------------------
 clickhouse = { version = "0.1", optional = true }
