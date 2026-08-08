@@ -1,27 +1,43 @@
-//! `HydraProxy`: the [`ProxyHttp`] impl wiring core pure functions to the
-//! Pingora request lifecycle (design §6.1).
+//! `HydraProxy`: the [`ProxyHttp`] impl running in **terminate-in-Pingora**
+//! mode (design-change `terminate-mode`).
 //!
-//! ## Zero-copy body forwarding (the validated mechanism)
+//! ## Terminate mode (the current, validated mechanism)
 //!
-//! The first request-body chunk is consumed in `request_filter` so the pure
-//! `extract_model` (`memchr`) can pull the routing key before `upstream_peer`.
-//! **Retry buffering is enabled before the read** so Pingora's internal retry
-//! buffer captures the consumed bytes; `request_proxy` then replays them through
-//! `request_body_filter`, ensuring the upstream receives the complete body
-//! (SPIKE finding — hypothesis (b) re-injection was abandoned because
-//! `is_body_done()` suppresses body forwarding when the whole body fits in one
-//! chunk; retry buffering is the correct mechanism). Failover replay uses
-//! `body_buffer` (Vec\<Bytes\>, no 64 KiB limit) accumulated in
-//! `request_body_filter` (§8.5).
+//! The whole gateway lifecycle happens inside [`ProxyHttp::request_filter`]:
 //!
-//! See `tests/spike_zero_copy.rs` for the evidence.
+//! 1. Domain → tenant, api-key parse, external auth (cache-first).
+//! 2. **Read the full downstream body** (`read_request_body` loop → `Bytes`).
+//! 3. `extract_model` over the *full* body (memchr — trivial for any
+//!    position/schema; the stream-through "first-chunk gamble" is gone).
+//! 4. `router::resolve` + `swrr::order` → ordered candidate list.
+//! 5. Pre-limit count gate.
+//! 6. **Failover loop**: for each candidate, build the upstream request
+//!    (swap key, `/v1` rewrite, Host) via [`ProviderClient`], send it, and on
+//!    success stream the response back chunk-by-chunk through the downstream
+//!    `Session`. On failure, `breaker.on_failure` + `continue` to the next
+//!    candidate (the body is `Bytes` — O(1) clone per replay).
+//! 7. `return Ok(true)` so Pingora **never dials an upstream itself**.
+//!
+//! `upstream_peer` is a mandatory trait method but returns a sentinel peer that
+//! is never contacted.
+//!
+//! ## Why not stream-through anymore
+//!
+//! The previous zero-copy stream-through design fought Pingora's retry
+//! machinery (the retry-buffer enablement hack, a `Vec<Bytes>` accumulator,
+//! `set_retry`, the 64 KiB retry-buffer ceiling, a passthrough fallback) and only worked
+//! when `"model"` sat in the *first* body chunk. Late-model clients (large
+//! system/tools/history prefixes) broke routing. Terminating in Pingora makes
+//! model extraction trivial and failover a plain `for` loop. See
+//! `docs/design-change-terminate-mode.md` (§1/§4.5) and `tests/terminate_mode.rs`.
 //!
 //! ## What this module does NOT do
 //!
 //! - It never mocks routing / SWRR / breaker / parsing — those W1 pure fns are
 //!   called directly with real `ConfigData`.
-//! - Downstream TLS (cert callback) is W4b; this wave uses a plain `add_tcp`
-//!   listener. Upstream TLS (provider HTTPS) IS wired here.
+//! - It never serialises/deserialises the request body — `Bytes` flows into
+//!   reqwest untouched and response chunks flow back untouched (the
+//!   "no JSON encode/decode on the hot path" claim is preserved).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,14 +47,14 @@ use hydra_core::auth::{AuthVerdict, CacheSource};
 use hydra_core::config::ConfigData;
 use hydra_core::extract::extract_model;
 use hydra_core::limit::MatchCtx;
-use hydra_core::model::RouteError;
-use hydra_core::rewrite::{mask_key, rewrite_path};
+use hydra_core::model::{Candidate, RouteError};
+use hydra_core::rewrite::mask_key;
 use hydra_core::router;
 use hydra_core::swrr;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Error as PingoraError;
 use pingora_core::Result as PingoraResult;
-use pingora_http::{RequestHeader, ResponseHeader};
+use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session};
 use rand::seq::SliceRandom;
 use tracing::{debug, info, warn};
@@ -48,7 +64,8 @@ use crate::proxy::breaker_wrap::CircuitBreaker;
 use crate::proxy::config::ProxyConfig;
 use crate::proxy::ctx::RequestContext;
 use crate::proxy::limiter::{CountVerdict, RateLimiter};
-use crate::proxy::peer::{build_peer, parse_endpoint};
+use crate::proxy::peer::parse_endpoint;
+use crate::proxy::provider_client::ProviderClient;
 use crate::sink::UsageSink;
 use crate::store::ConfigStore;
 
@@ -57,13 +74,14 @@ pub mod config;
 pub mod ctx;
 pub mod limiter;
 pub mod peer;
+pub mod provider_client;
 
-/// The currently-selected upstream route, written by `upstream_peer` and read
-/// by `upstream_request_filter` / `fail_to_connect` / `logging`.
+/// The currently-selected upstream route, written in the failover loop when a
+/// candidate answers successfully and read by `logging`.
 #[derive(Clone, Debug)]
 pub struct SelectedRoute {
     pub provider_id: String,
-    /// Parsed endpoint (for SNI / Host / path-prefix joins).
+    /// Parsed endpoint (host used for the usage record).
     pub endpoint: hydra_core::rewrite::EndpointUrl,
     /// The provider api-key chosen at random for this attempt (replaces the
     /// client's `Authorization`).
@@ -89,24 +107,29 @@ pub struct AppState {
     pub proxy: ProxyConfig,
 }
 
-/// The `ProxyHttp` impl wiring the W1/W2/W3 pure functions to the Pingora
-/// lifecycle hooks. One instance lives for the whole server; per-request state
-/// lives in [`RequestContext`].
+/// The `ProxyHttp` impl wiring the W1/W2/W3 pure functions to a terminate-mode
+/// gateway that lives entirely in `request_filter`. One instance lives for the
+/// whole server; per-request state lives in [`RequestContext`].
 pub struct HydraProxy {
     pub state: Arc<AppState>,
+    /// Long-lived upstream HTTP client (own connection pool, long timeout for
+    /// SSE/LLM). Built once; cheap to hold.
+    pub provider_client: ProviderClient,
 }
 
 impl HydraProxy {
-    /// Build with the shared app state.
+    /// Build with the shared app state. The provider client is constructed
+    /// here (infallible — see [`ProviderClient::new`]).
     #[must_use]
     pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            provider_client: ProviderClient::new(),
+        }
     }
 
     /// Resolve the tenant from the downstream `Host` header (design §6.3 §1).
-    /// `localhost` / missing Host maps to the `localhost` tenant. Returns the
-    /// cloned `Tenant` so the caller can stash it in ctx without borrowing the
-    /// snapshot guard.
+    /// `localhost` / missing Host maps to the `localhost` tenant.
     fn resolve_tenant(cfg: &ConfigData, host: &str) -> Option<hydra_core::model::Tenant> {
         let domain = host.split(':').next().unwrap_or("").to_ascii_lowercase();
         let lookup = if domain.is_empty() || domain == "localhost" {
@@ -166,8 +189,21 @@ impl ProxyHttp for HydraProxy {
     }
 
     // -----------------------------------------------------------------------
-    // request_filter — design §6.3 (auth → model extract → route → pre-limit)
+    // request_filter — the FULL terminate-mode gateway lifecycle.
     // -----------------------------------------------------------------------
+    //
+    // Steps (design-change §4.1):
+    //   ①  domain → tenant
+    //   ②  api-key parse
+    //   ③  external auth (cache-first) + metrics
+    //   ④  read the FULL downstream body (loop → Bytes)
+    //   ⑤  extract_model over the full body (memchr — any position/schema)
+    //   ⑥  router::resolve + swrr::order  (+ passthrough fallback)
+    //   ⑦  pre-limit count gate
+    //   ⑧  failover loop: build → send → stream-back, breaker on success/fail
+    //   ⑨  return Ok(true)  ← Pingora never dials upstream itself
+    //
+    // On any short-circuit we write a structured error body and return Ok(true).
     async fn request_filter(
         &self,
         session: &mut Session,
@@ -216,7 +252,6 @@ impl ProxyHttp for HydraProxy {
         ctx.auth_verdict = Some(verdict.clone());
         // Metrics (§17): auth decision + cache size (+ upstream-error counter).
         {
-            use hydra_core::auth::{AuthVerdict, CacheSource};
             let src = match &verdict {
                 AuthVerdict::Allowed { source } | AuthVerdict::Denied { source, .. } => {
                     match source {
@@ -247,93 +282,108 @@ impl ProxyHttp for HydraProxy {
             return Ok(true);
         }
 
-        // (5) First-chunk read + memchr model extraction (§6.3 §5, zero-copy).
-        //     We read exactly one chunk — enough for OpenAI-compatible bodies
-        //     where `"model"` is the first field. The chunk is stored and
-        //     re-injected on the first `request_body_filter` call.
-        let req_path = session.req_header().uri.path().to_string();
+        // (5) Read the FULL downstream body (terminate-mode §4.1 ④). Mirror the
+        //     admin full-body read pattern (admin/handlers.rs read_body). The
+        //     body is held as `Bytes` so failover replay across N candidates is
+        //     an O(1) refcount clone per attempt.
+        let req_header = session.req_header();
+        let req_path = req_header.uri.path().to_string();
+        let method = req_header.method.as_str();
         let is_v1_route = req_path.starts_with("/v1/");
-        let method = session.req_header().method.as_str();
         let has_body = method == "POST" || method == "PUT" || method == "PATCH";
+        // Snapshot the original request header (method/path/headers) so
+        // build_request can rebuild the upstream request from it later. The
+        // immutable borrow of `session` ends here (NLL), allowing the mutable
+        // `as_downstream_mut().read_request_body()` calls below.
+        let original_header = req_header.clone();
 
-        let model_opt: Option<String> = if has_body && is_v1_route {
-            // Enable retry buffering BEFORE reading the body (§6.3 §5, SPIKE
-            // finding). Pingora's retry buffer captures the bytes consumed by
-            // read_request_body, and request_proxy replays them through
-            // request_body_filter so the upstream receives the complete body.
-            // Without this, is_body_done() becomes true and Pingora skips body
-            // forwarding entirely (validated by tests/spike_zero_copy.rs).
-            session.as_downstream_mut().enable_retry_buffering();
-            let first = session.as_downstream_mut().read_request_body().await?;
-            if let Some(chunk) = first {
-                // Hard cap (§8.5): a single chunk already over the hard cap → 413.
-                if chunk.len() as u64 > self.state.proxy.max_request_body_hard {
-                    ctx.hard_capped = true;
+        let body_bytes: Bytes = if has_body {
+            let mut buf = Vec::new();
+            while let Ok(Some(chunk)) = session.as_downstream_mut().read_request_body().await {
+                buf.extend_from_slice(&chunk);
+                // Hard cap (§8.5): a body over the hard cap returns 413. The
+                // soft cap is gone (no replay buffer to disable), but the hard
+                // cap still protects the gateway from unbounded buffering.
+                if buf.len() as u64 > self.state.proxy.max_request_body_hard {
                     session.set_keepalive(None);
                     let _ = session.as_downstream_mut().drain_request_body().await;
                     return short_circuit(session, 413, "request_body_too_large").await;
                 }
-                // memchr extract (zero JSON parse, borrowed slice).
-                let model =
-                    extract_model(chunk.as_ref()).map(|b| String::from_utf8_lossy(b).into_owned());
-                // Store the first chunk for inspection / failover context.
-                // Accumulation for replay happens in request_body_filter (the
-                // retry buffer re-delivers this chunk through that hook).
-                ctx.first_chunk = Some(chunk);
-                model
-            } else {
-                None
             }
+            Bytes::from(buf)
+        } else {
+            Bytes::new()
+        };
+
+        // (6) Model extraction over the FULL body (terminate-mode §4.1 ④').
+        //     memchr anywhere in the body — works for any position/schema, the
+        //     root cause fix for late-model clients. No JSON encode/decode.
+        let model_opt: Option<String> = if has_body && is_v1_route {
+            extract_model(body_bytes.as_ref()).map(|b| String::from_utf8_lossy(b).into_owned())
         } else {
             None
         };
 
-        // (5a) Non-JSON / no-model path (§6.3a): passthrough or reject.
-        let model_key = match model_opt {
-            Some(m) => m,
+        // (7) Route (§6.3 §6 / §7): pure resolve + swrr.order, OR passthrough.
+        let (candidates, model_for_route) = match model_opt {
+            Some(m) => {
+                let model_key = m;
+                let cands =
+                    match router::resolve(cfg, self.state.breaker.as_ref(), &tenant, &model_key) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            ctx.route_error = Some(e);
+                            ctx.model_key = Some(model_key.clone());
+                            let status = route_error_status(e);
+                            let reason = route_error_reason(e);
+                            crate::admin::metrics::record_route_error(&tenant_id, reason);
+                            return short_circuit(session, status, reason).await;
+                        }
+                    };
+                (cands, Some(model_key))
+            }
             None => {
+                // Non-routable: no `model` field. Apply the configured strategy
+                // (§6.3a). In terminate mode "passthrough" is just a degenerate
+                // single-candidate forward through the same failover loop.
                 match self.state.proxy.non_route_strategy {
                     config::NonRouteStrategy::Reject => {
                         return short_circuit(session, 400, "no_model_field").await;
                     }
                     config::NonRouteStrategy::Passthrough => {
-                        ctx.passthrough = true;
-                        ctx.model_key = None;
-                        // Pick the tenant's first live provider for passthrough.
-                        return select_passthrough(&self.state.store, &tenant_id, ctx);
+                        match passthrough_candidates(cfg, &tenant_id) {
+                            Some(c) => (c, None),
+                            None => {
+                                ctx.route_error = Some(RouteError::NoAvailableProvider);
+                                crate::admin::metrics::record_route_error(
+                                    &tenant_id,
+                                    "no_available_provider",
+                                );
+                                return short_circuit(session, 503, "no_live_provider").await;
+                            }
+                        }
                     }
                 }
             }
         };
-        ctx.model_key = Some(model_key.clone());
+        ctx.model_key = model_for_route.clone();
 
-        // (6) Route (§6.3 §6 / §7): pure resolve + swrr.order with the live
-        //     SwrrState from the ConfigStore's DashMap.
-        let candidates =
-            match router::resolve(cfg, self.state.breaker.as_ref(), &tenant, &model_key) {
-                Ok(c) => c,
-                Err(e) => {
-                    ctx.route_error = Some(e);
-                    let status = route_error_status(e);
-                    let reason = route_error_reason(e);
-                    crate::admin::metrics::record_route_error(&tenant_id, reason);
-                    return short_circuit(session, status, reason).await;
-                }
-            };
-        // Swrr order: thread the per-(tenant,model) state from the DashMap.
+        // SWRR order over the resolved candidates (skip for passthrough — a
+        // single candidate needs no ordering). Thread the per-(tenant,model)
+        // state from the ConfigStore's DashMap.
         let mut candidates = candidates;
-        {
-            let key = (tenant_id.clone(), model_key.clone());
+        if let Some(model_key) = model_for_route.as_deref() {
+            let key = (tenant_id.clone(), model_key.to_string());
             let mut guard = self.state.store.swrr().entry(key).or_default();
             swrr::order(&mut candidates, &mut guard);
         }
-        ctx.candidates = candidates;
+        ctx.candidates = candidates.clone();
 
-        // (7) Pre-limit count gate (§6.3 §7 / §10.3).
+        // (8) Pre-limit count gate (§6.3 §7 / §10.3).
         let masked = mask_key(&api_key);
         let match_ctx = MatchCtx {
             api_key: Some(&masked),
-            model: Some(&model_key),
+            model: model_for_route.as_deref(),
             tenant: Some(&tenant_id),
             provider: None,
         };
@@ -348,267 +398,187 @@ impl ProxyHttp for HydraProxy {
             return short_circuit(session, 429, "rate_limited").await;
         }
 
-        // (8) Continue to upstream_peer.
-        Ok(false)
+        // (9) Failover loop (terminate-mode §4.1 ⑦/⑧). Body is in hand as
+        //     `Bytes`; each attempt is an O(1) clone. On a connect/HTTP error
+        //     we breaker.on_failure + continue. On a 2xx response we stream it
+        //     back chunk-by-chunk and break.
+        //
+        // KNOWN LIMITATION: once `write_response_header` + any
+        // `write_response_body` chunk has been sent, failover is impossible —
+        // the client already received a 200 + partial body. A mid-stream error
+        // (provider reset, network drop) is logged and the connection is
+        // closed; we do NOT retry. This is the same constraint as the prior
+        // design's `upstream_bytes_seen > 0` rule (§8.2/§8.3) and is
+        // unavoidable for any streaming gateway.
+        let mut last_status: u16 = 502;
+        let mut last_error: Option<String> = None;
+        for cand in &candidates {
+            let Some(provider) = cfg.providers.get(&cand.provider_id) else {
+                warn!(provider_id = %cand.provider_id, "candidate provider missing from config");
+                last_error = Some(format!("provider {} missing", cand.provider_id));
+                continue;
+            };
+            let Some(endpoint) = parse_endpoint(&provider.endpoint) else {
+                warn!(provider_id = %cand.provider_id, "candidate endpoint unparseable");
+                last_error = Some(format!("provider {} bad endpoint", cand.provider_id));
+                continue;
+            };
+            let Some(keys) = cfg.provider_keys.get(&cand.provider_id) else {
+                warn!(provider_id = %cand.provider_id, "candidate has no api keys");
+                last_error = Some(format!("provider {} no key", cand.provider_id));
+                continue;
+            };
+            let Some(upstream_key) = keys.choose(&mut rand::thread_rng()) else {
+                continue;
+            };
+
+            // Build + send (Oracle correction #10: start the TTFT timer before send).
+            let req = self.provider_client.build_request(
+                &original_header,
+                provider,
+                upstream_key,
+                &body_bytes,
+                &ctx.trace_id,
+            );
+            ctx.upstream_started_at = Some(Instant::now());
+            let send_result = self.provider_client.send(req).await;
+
+            match send_result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let status_code = status.as_u16();
+                    last_status = status_code;
+                    if status.is_success() {
+                        // ── Success: stream the response back to the client.
+                        ctx.status_code = status_code;
+                        ctx.selected = Some(SelectedRoute {
+                            provider_id: cand.provider_id.clone(),
+                            endpoint: endpoint.clone(),
+                            upstream_api_key: upstream_key.clone(),
+                        });
+                        ctx.upstream_host = Some(endpoint.host.clone());
+                        // Metrics (§17): upstream time-to-first-byte.
+                        if let Some(model) = model_for_route.as_deref() {
+                            if let Some(start) = ctx.upstream_started_at {
+                                crate::admin::metrics::record_upstream_duration(
+                                    &cand.provider_id,
+                                    model,
+                                    start.elapsed().as_secs_f64(),
+                                );
+                            }
+                        }
+                        self.state.breaker.on_success(&cand.provider_id);
+
+                        if let Err(e) = self
+                            .stream_response(session, ctx, resp, &tenant_id, &cand.provider_id)
+                            .await
+                        {
+                            // Mid-stream failure after the header/first chunk was
+                            // already written: failover is impossible (client saw
+                            // 200 + partial body). Log + close. Do NOT retry.
+                            warn!(
+                                trace_id = %ctx.trace_id,
+                                provider_id = %cand.provider_id,
+                                error = %e,
+                                "mid-stream SSE failure after header sent; closing connection (no failover)"
+                            );
+                            return Ok(true);
+                        }
+                        return Ok(true);
+                    } else {
+                        // 4xx/5xx from provider — not a connect failure, but
+                        // the provider answered. Record breaker failure +
+                        // retry the next candidate (body still in hand).
+                        self.state.breaker.on_failure(&cand.provider_id);
+                        last_error = Some(format!(
+                            "provider {} returned {}",
+                            cand.provider_id, status_code
+                        ));
+                        debug!(
+                            provider_id = %cand.provider_id,
+                            status = status_code,
+                            "provider returned non-2xx; trying next candidate"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Connect / transport failure → breaker + next candidate.
+                    self.state.breaker.on_failure(&cand.provider_id);
+                    last_error = Some(format!("provider {}: {e}", cand.provider_id));
+                    debug!(
+                        provider_id = %cand.provider_id,
+                        error = %e,
+                        "provider send failed; trying next candidate"
+                    );
+                }
+            }
+
+            // Record a failover retry for every candidate we fall through from
+            // (Oracle correction #5). Preserves `hydra_retries_total`.
+            if let (Some(t), Some(m)) = (ctx.tenant.as_ref(), ctx.model_key.as_deref()) {
+                crate::admin::metrics::record_retry(&t.id, m, "terminate_loop");
+            } else if let Some(t) = ctx.tenant.as_ref() {
+                crate::admin::metrics::record_retry(&t.id, "", "terminate_loop");
+            }
+        }
+
+        // All candidates exhausted (§4.1 final branch). Map the last status to
+        // a gateway response: provider-surfaced errors are forwarded verbatim
+        // when they carry a useful code (e.g. 404/401/429), otherwise 502.
+        ctx.status_code = last_status;
+        let reason = match last_status {
+            400 | 401 | 403 | 404 | 409 | 413 | 422 => "provider_error",
+            429 => "provider_rate_limited",
+            _ => "all_proxies_failed",
+        };
+        info!(
+            trace_id = %ctx.trace_id,
+            status = last_status,
+            error = ?last_error,
+            "all candidates exhausted; returning last provider status"
+        );
+        // Forward a compact JSON error echoing the upstream code so clients see
+        // a structured error rather than an empty gateway response.
+        let body = Bytes::from(format!(
+            "{{\"error\":{{\"message\":\"{reason}\",\"type\":\"proxy_error\",\"upstream_status\":{last_status}}}}}"
+        ));
+        session.set_keepalive(None);
+        // respond_error_with_body maps non-standard codes onto its own; use the
+        // explicit header writer when we must preserve a specific upstream code.
+        if (400..=599).contains(&last_status) {
+            let mut resp_header = ResponseHeader::build(last_status, Some(1))?;
+            resp_header.insert_header("Content-Type", "application/json")?;
+            resp_header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
+            session
+                .write_response_header(Box::new(resp_header), false)
+                .await?;
+            session.write_response_body(Some(body), true).await?;
+        } else {
+            session.respond_error(502).await?;
+        }
+        Ok(true)
     }
 
     // -----------------------------------------------------------------------
-    // upstream_peer — design §6.4 (select current candidate → HttpPeer)
+    // upstream_peer — trait-mandatory sentinel. NEVER called: request_filter
+    // returns Ok(true), so Pingora never reaches the upstream dial path.
     // -----------------------------------------------------------------------
     async fn upstream_peer(
         &self,
         _session: &mut Session,
-        ctx: &mut RequestContext,
+        _ctx: &mut RequestContext,
     ) -> PingoraResult<Box<HttpPeer>> {
-        let cfg = self.state.store.snapshot();
-        if ctx.passthrough {
-            // Passthrough (§6.3a): use the already-selected passthrough route,
-            // or build one from the tenant's first live provider.
-            let sel = ctx
-                .selected
-                .clone()
-                .ok_or_else(|| pingora_err("passthrough_no_route"))?;
-            return Ok(Box::new(build_peer(&sel.endpoint)));
-        }
-        let cand = ctx
-            .candidates
-            .get(ctx.cursor)
-            .ok_or_else(|| pingora_err("no_candidate"))?;
-        let provider = cfg
-            .providers
-            .get(&cand.provider_id)
-            .ok_or_else(|| pingora_err("provider_missing"))?;
-        let endpoint =
-            parse_endpoint(&provider.endpoint).ok_or_else(|| pingora_err("invalid_endpoint"))?;
-        // Pick a random api-key for this provider (design §6.4).
-        let keys = cfg
-            .provider_keys
-            .get(&cand.provider_id)
-            .ok_or_else(|| pingora_err("no_api_key"))?;
-        let key = keys
-            .choose(&mut rand::thread_rng())
-            .ok_or_else(|| pingora_err("empty_api_key"))?;
-        ctx.selected = Some(SelectedRoute {
-            provider_id: cand.provider_id.clone(),
-            endpoint: endpoint.clone(),
-            upstream_api_key: key.clone(),
-        });
-        ctx.upstream_host = Some(endpoint.host.clone());
-        // Mark when we hand off to the upstream so the first response byte can
-        // observe `hydra_upstream_duration_seconds` (§17).
-        ctx.upstream_started_at = Some(Instant::now());
-        Ok(Box::new(build_peer(&endpoint)))
-    }
-
-    // -----------------------------------------------------------------------
-    // upstream_request_filter — design §6.5 (auth/host/path/trace rewrite)
-    // -----------------------------------------------------------------------
-    async fn upstream_request_filter(
-        &self,
-        _session: &mut Session,
-        upstream_request: &mut RequestHeader,
-        ctx: &mut RequestContext,
-    ) -> PingoraResult<()>
-    where
-        Self::CTX: Send + Sync,
-    {
-        let Some(sel) = ctx.selected.as_ref() else {
-            return Ok(());
-        };
-
-        if !ctx.passthrough {
-            // Replace Authorization with the provider key (§6.5).
-            upstream_request
-                .insert_header("Authorization", format!("Bearer {}", sel.upstream_api_key))?;
-        }
-        // Rewrite path: join the downstream tail onto the endpoint base (§6.5).
-        let req_path = upstream_request.uri.path().to_string();
-        let new_url = rewrite_path(&req_path, &sel.endpoint);
-        // Apply by setting the full URI (path + keeps scheme/host authority).
-        if let Ok(parsed) = new_url.parse::<http::Uri>() {
-            upstream_request.set_uri(parsed);
-        }
-        // Host / :authority → provider host (§6.5).
-        upstream_request.insert_header("Host", &sel.endpoint.host)?;
-        // Trace id (design §6.5 / §13.1).
-        upstream_request.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // request_body_filter — accumulate for failover replay
-    // -----------------------------------------------------------------------
-    // The retry buffer (enabled in request_filter) handles re-delivering the
-    // consumed first chunk. This hook only accumulates body chunks into
-    // ctx.body_buffer for failover replay (§8.3/§8.5). No re-injection needed.
-    async fn request_body_filter(
-        &self,
-        _session: &mut Session,
-        body: &mut Option<Bytes>,
-        end_of_stream: bool,
-        ctx: &mut RequestContext,
-    ) -> PingoraResult<()>
-    where
-        Self::CTX: Send + Sync,
-    {
-        // Accumulate for replay unless over the soft cap.
-        if let Some(chunk) = body.as_ref() {
-            ctx.accumulated_bytes += chunk.len() as u64;
-            if !ctx.body_too_large {
-                if ctx.accumulated_bytes > self.state.proxy.max_request_body {
-                    ctx.body_too_large = true;
-                    debug!(
-                        bytes = ctx.accumulated_bytes,
-                        "request body exceeded soft cap; replay disabled"
-                    );
-                } else {
-                    ctx.body_buffer.push(chunk.clone());
-                }
-            }
-        }
-
-        // Hard cap enforcement inside the stream (§8.5): if a later chunk
-        // pushes us over the hard cap we cannot 413 mid-stream cleanly, so we
-        // drop further accumulation and let the (already-started) request
-        // complete; body_too_large prevents replay. This is a best-effort
-        // guard; the strict hard-cap check runs in request_filter on the first
-        // chunk.
-        if ctx.accumulated_bytes > self.state.proxy.max_request_body_hard && !end_of_stream {
-            ctx.body_too_large = true;
-        }
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // upstream_response_filter — strip provider fingerprint (§6.6)
-    // -----------------------------------------------------------------------
-    async fn upstream_response_filter(
-        &self,
-        _session: &mut Session,
-        upstream_response: &mut ResponseHeader,
-        ctx: &mut RequestContext,
-    ) -> PingoraResult<()>
-    where
-        Self::CTX: Send + Sync,
-    {
-        upstream_response.remove_header("server");
-        upstream_response.remove_header("via");
-        upstream_response.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
-        // Record the status code for the usage record.
-        ctx.status_code = upstream_response.status.as_u16();
-        // Metrics (§17): upstream time-to-first-byte, if a start was captured.
-        if let (Some(start), Some(pid), Some(model)) = (
-            ctx.upstream_started_at,
-            ctx.selected.as_ref().map(|s| s.provider_id.as_str()),
-            ctx.model_key.as_deref(),
-        ) {
-            let elapsed = start.elapsed().as_secs_f64();
-            crate::admin::metrics::record_upstream_duration(pid, model, elapsed);
-        }
-        // On a 2xx first byte, mark success for the breaker (§6.6).
-        if ctx.status_code >= 200 && ctx.status_code < 300 {
-            if let Some(pid) = ctx.current_provider_id().map(str::to_string) {
-                self.state.breaker.on_success(&pid);
-            }
-        }
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // upstream_response_body_filter — memchr usage scan + bytes_seen (§6.6/§9.4)
-    // -----------------------------------------------------------------------
-    fn upstream_response_body_filter(
-        &self,
-        _session: &mut Session,
-        body: &mut Option<Bytes>,
-        _end_of_stream: bool,
-        ctx: &mut RequestContext,
-    ) -> PingoraResult<Option<std::time::Duration>> {
-        if let Some(chunk) = body.as_ref() {
-            ctx.upstream_bytes_seen += chunk.len() as u64;
-            // memchr scan (zero-alloc); the scanner allocates only on a hit.
-            let _ = ctx.scanner.scan_chunk(chunk.as_ref());
-        }
-        // Pass chunk UNMODIFIED (zero-copy passthrough, §6.6).
-        Ok(None)
-    }
-
-    // -----------------------------------------------------------------------
-    // fail_to_connect — §8.1: always retry connect-stage failures
-    // -----------------------------------------------------------------------
-    fn fail_to_connect(
-        &self,
-        _session: &mut Session,
-        _peer: &HttpPeer,
-        ctx: &mut RequestContext,
-        mut e: Box<PingoraError>,
-    ) -> Box<PingoraError> {
-        if let Some(pid) = ctx.current_provider_id().map(str::to_string) {
-            self.state.breaker.on_failure(&pid);
-        }
-        let more = ctx.cursor + 1 < ctx.candidates.len();
-        if more {
-            ctx.cursor += 1;
-            e.set_retry(true);
-            if let (Some(t), Some(m)) = (ctx.tenant.as_ref(), ctx.model_key.as_deref()) {
-                crate::admin::metrics::record_retry(&t.id, m, "connect");
-            }
-            info!(
-                cursor = ctx.cursor,
-                attempts = ctx.candidates.len(),
-                "fail_to_connect: retrying next candidate"
-            );
-        } else {
-            warn!(
-                attempts = ctx.candidates.len(),
-                "fail_to_connect: no more candidates"
-            );
-        }
-        e
-    }
-
-    // -----------------------------------------------------------------------
-    // error_while_proxy — §8.3: conditional retry (opt-in)
-    // -----------------------------------------------------------------------
-    fn error_while_proxy(
-        &self,
-        _peer: &HttpPeer,
-        _session: &mut Session,
-        mut e: Box<PingoraError>,
-        ctx: &mut RequestContext,
-        _client_reused: bool,
-    ) -> Box<PingoraError> {
-        if let Some(pid) = ctx.current_provider_id().map(str::to_string) {
-            self.state.breaker.on_failure(&pid);
-        }
-        let cfg = self.state.proxy.failover;
-        let body_replayable = !ctx.body_too_large && !ctx.body_buffer.is_empty();
-        let first_byte_not_seen = ctx.upstream_bytes_seen == 0;
-        let more = ctx.cursor + 1 < ctx.candidates.len();
-        if cfg.retry_after_connect && first_byte_not_seen && body_replayable && more {
-            ctx.cursor += 1;
-            e.set_retry(true);
-            if let (Some(t), Some(m)) = (ctx.tenant.as_ref(), ctx.model_key.as_deref()) {
-                crate::admin::metrics::record_retry(&t.id, m, "proxy");
-            }
-            warn!(
-                cursor = ctx.cursor,
-                "error_while_proxy: opt-in retry to next candidate (may double-bill)"
-            );
-        } else {
-            // Default: do NOT retry mid-stream (§8.2/§8.3).
-            if ctx.upstream_bytes_seen > 0 {
-                debug!("error_while_proxy: no retry (upstream bytes already seen)");
-            } else if !cfg.retry_after_connect {
-                debug!("error_while_proxy: no retry (retry_after_connect=false)");
-            }
-        }
-        e
+        // Oracle correction #9: a real (inert) peer, not unreachable!(), so an
+        // accidental call never panics the worker.
+        Ok(Box::new(HttpPeer::new("127.0.0.1:0", false, String::new())))
     }
 
     // -----------------------------------------------------------------------
     // logging — §6.6: latency/usage → UsageSink.record
     // -----------------------------------------------------------------------
+    // KEPT UNCHANGED from the stream-through design: it finalises ctx.scanner
+    // (populated during the stream-back loop in request_filter) into ctx.usage,
+    // then emits metrics + the usage record + token-window accounting.
     async fn logging(
         &self,
         session: &mut Session,
@@ -623,7 +593,7 @@ impl ProxyHttp for HydraProxy {
         } else {
             session.response_written().map_or(0, |r| r.status.as_u16())
         };
-        // Finalise the usage scanner.
+        // Finalise the usage scanner (populated during the SSE stream-back).
         let usage = std::mem::replace(
             &mut ctx.scanner,
             hydra_core::sse::UsageScanner::new(hydra_core::model::ProviderKind::Generic),
@@ -714,7 +684,83 @@ impl ProxyHttp for HydraProxy {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// HydraProxy helpers
+// ---------------------------------------------------------------------------
+
+impl HydraProxy {
+    /// Stream a successful provider response back to the downstream `Session`
+    /// chunk-by-chunk, scanning each chunk for SSE usage with `ctx.scanner`
+    /// (terminate-mode §4.1 ⑧). Keeps the connection from being reused for
+    /// keep-alive (SSE/LLM responses are long-lived) and writes a terminal EOS.
+    ///
+    /// Returns an error if any downstream write fails — the caller treats that
+    /// as a non-retryable mid-stream failure (the header was already sent).
+    async fn stream_response(
+        &self,
+        session: &mut Session,
+        ctx: &mut RequestContext,
+        mut resp: reqwest::Response,
+        _tenant_id: &str,
+        _provider_id: &str,
+    ) -> PingoraResult<()> {
+        // Build the downstream response header from the upstream status.
+        let status = resp.status().as_u16();
+        // Forward content-type + a small set of useful headers, collected as
+        // owned `(String, String)` pairs first so the immutable borrow of
+        // `resp` ends before the mutable `resp.chunk()` loop. Strip provider
+        // fingerprints (server/via) like the old upstream_response_filter did,
+        // plus hop-by-hop / encoding headers that must not be echoed.
+        const SKIP: &[&str] = &[
+            "server",
+            "via",
+            "transfer-encoding",
+            "content-length",
+            "connection",
+            // reqwest/hyper already decoded any content-encoding; we ship raw
+            // bytes downstream, so do not echo it.
+            "content-encoding",
+        ];
+        let forwarded: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .filter(|(name, _)| !SKIP.iter().any(|s| name.as_str().eq_ignore_ascii_case(s)))
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_string(), v.to_string()))
+            })
+            .collect();
+        let mut resp_header = ResponseHeader::build(status, Some(8))?;
+        for (name, value) in forwarded {
+            let _ = resp_header.append_header(name, value);
+        }
+        let _ = resp_header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id);
+
+        // Long-lived response — disable keep-alive reuse (Oracle correction #6).
+        session.as_downstream_mut().set_keepalive(None);
+        session
+            .write_response_header(Box::new(resp_header), false)
+            .await?;
+
+        // Stream body chunks: scan for usage (memchr) + write downstream.
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| pingora_err(format!("upstream stream read error: {e}")))?
+        {
+            // memchr usage scan over the chunk (zero-alloc common path).
+            let _ = ctx.scanner.scan_chunk(chunk.as_ref());
+            session.write_response_body(Some(chunk), false).await?;
+        }
+        // Terminal EOS.
+        session.write_response_body(None, true).await?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free helpers
 // ---------------------------------------------------------------------------
 
 /// Write a short error response and return `Ok(true)` (short-circuit the
@@ -729,24 +775,18 @@ async fn short_circuit(session: &mut Session, status: u16, reason: &str) -> Ping
     Ok(true)
 }
 
-/// Select the passthrough route (§6.3a): the tenant's first live, non-dead
-/// provider with a key.
-fn select_passthrough(
-    store: &ConfigStore,
-    tenant_id: &str,
-    ctx: &mut RequestContext,
-) -> PingoraResult<bool> {
-    let cfg = store.snapshot();
-    let Some(providers) = cfg.tenant_providers.get(tenant_id) else {
-        return short_circuit_passthrough_err(ctx, 503, "no_provider_for_tenant");
-    };
-    // Pick the first live provider (weight > 0, not dead, has a key).
+/// Build a degenerate single-candidate list for **passthrough** requests (no
+/// `model` field, `NonRouteStrategy::Passthrough`): the tenant's first live,
+/// non-dead provider with weight > 0 and at least one api-key. In terminate
+/// mode passthrough is just a one-element failover loop — no upstream_peer /
+/// retry-buffer machinery.
+///
+/// Returns `None` when no live provider exists (caller maps to 503).
+fn passthrough_candidates(cfg: &ConfigData, tenant_id: &str) -> Option<Vec<Candidate>> {
+    let providers = cfg.tenant_providers.get(tenant_id)?;
     let mut pids: Vec<&String> = providers.iter().collect();
-    pids.sort(); // deterministic
+    pids.sort(); // deterministic ordering
     for pid in pids {
-        if ctx_breaker_dead(pid) {
-            continue;
-        }
         let Some(provider) = cfg.providers.get(pid) else {
             continue;
         };
@@ -759,53 +799,13 @@ fn select_passthrough(
         if keys.is_empty() {
             continue;
         }
-        let Some(endpoint) = parse_endpoint(&provider.endpoint) else {
-            continue;
-        };
-        let Some(key) = keys.choose(&mut rand::thread_rng()) else {
-            continue;
-        };
-        ctx.selected = Some(SelectedRoute {
+        return Some(vec![Candidate {
             provider_id: pid.clone(),
-            endpoint: endpoint.clone(),
-            upstream_api_key: key.clone(),
-        });
-        ctx.upstream_host = Some(endpoint.host.clone());
-        return Ok(false);
+            endpoint: provider.endpoint.clone(),
+            weight: provider.weight,
+        }]);
     }
-    short_circuit_passthrough_err(ctx, 503, "no_live_provider")
-}
-
-/// Passthrough cannot short-circuit the session here (it runs inside
-/// request_filter with `&mut Session` borrowed elsewhere) — instead record the
-/// failure and let upstream_peer fail. The caller has the session in scope, so
-/// we return Ok(false) but set route_error; upstream_peer then errors and
-/// fail_to_proxy writes the response.
-///
-/// In practice request_filter owns the session, but to keep the borrow graph
-/// simple we defer the 503 to the standard error path.
-fn short_circuit_passthrough_err(
-    ctx: &mut RequestContext,
-    _status: u16,
-    reason: &str,
-) -> PingoraResult<bool> {
-    ctx.route_error = Some(RouteError::NoAvailableProvider);
-    debug!(reason, "passthrough: no live provider");
-    // We cannot write the response from here cleanly; signal failure via an
-    // error so fail_to_proxy handles it.
-    Err(pingora_err(reason))
-}
-
-/// Check the breaker for a provider id without taking a second snapshot guard.
-fn ctx_breaker_dead(_pid: &str) -> bool {
-    // The breaker is held by AppState; this helper exists so select_passthrough
-    // (which only has &ConfigStore) can still consult it via the store's
-    // breaker. ConfigStore does not own the breaker, so passthrough relies on
-    // resolve having already filtered dead providers — here we approximate by
-    // never skipping (the breaker check happens in the resolve path for routed
-    // requests; passthrough is best-effort and tolerates a dead first attempt
-    // because fail_to_connect will retry).
-    false
+    None
 }
 
 /// Map a [`RouteError`] to its HTTP status (design §7.3).
@@ -835,8 +835,8 @@ fn pingora_err<S: Into<String>>(msg: S) -> Box<PingoraError> {
     PingoraError::explain(InternalError, msg.into())
 }
 
-/// Current time as an ISO-8601 UTC string (the sink column is text; core has
-/// no chrono dependency, so the shell formats it here).
+/// Current time as an ISO-8601-ish UTC string (the sink column is text; core
+/// has no chrono dependency, so the shell formats it here).
 fn now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
