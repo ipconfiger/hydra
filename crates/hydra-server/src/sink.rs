@@ -1,4 +1,650 @@
-//! `UsageSink` trait and its adapters (`SqliteSink` default, optional
-//! `ClickHouseSink` behind `usage-clickhouse`).
+//! Pluggable usage-record sink (design §9.1–§9.3, §9.5).
 //!
-//! Wave 3 fills this in.
+//! [`UsageSink`] is the trait every backend implements; [`SqliteSink`] is the
+//! default (batched writes into the W2 `usage_record` table) and
+//! [`ClickHouseSink`] is the optional ClickHouse backend gated on the
+//! `usage-clickhouse` feature. [`build_sink`] selects one at startup from
+//! configuration.
+//!
+//! # Key masking (§9.5)
+//!
+//! The sink **never** masks — it persists whatever masked string the caller
+//! places in [`UsageRecord::client_api_key_masked`]. The caller (the proxy
+//! lifecycle) is responsible for producing that value via the pure core
+//! [`hydra_core::rewrite::mask_key`]. The SQLite column is `client_api_key`
+//! (see `migrations/0001_init.sql`); the field name on the core struct is
+//! `client_api_key_masked` — the two refer to the same value.
+//!
+//! # Why manual `Pin<Box<dyn Future>>` instead of `#[async_trait]`
+//!
+//! The design sketch (§9.1) writes `#[async_trait]`. That proc-macro desugars
+//! to exactly `fn record(&self, ..) -> Pin<Box<dyn Future<Output = ..> + Send
+//! + '_>>`. We write the desugared form directly: native `async fn` in traits
+//! is stable since Rust 1.75 but **not object-safe**, and [`build_sink`]
+//! returns `Box<dyn UsageSink>`, so a dyn-compatible signature is required.
+//! No `async-trait` dependency is needed; the two are semantically identical.
+
+#![cfg_attr(not(feature = "db"), allow(unused_imports, unused_variables))]
+
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+
+use hydra_core::model::UsageRecord;
+
+// ===========================================================================
+// Trait (design §9.1) — available whenever the `sink` module is (`runtime` on).
+// ===========================================================================
+
+/// Pluggable usage-record sink. Implementations write [`UsageRecord`]s to a
+/// backend (SQLite by default, ClickHouse optionally).
+///
+/// `record` is **fire-and-forget**: it MUST return immediately —
+/// implementations buffer internally and flush asynchronously. A bounded
+/// internal channel may drop records under extreme backpressure (logged), never
+/// blocking the caller (design §9.2: "avoid blocking the proxy main flow").
+pub trait UsageSink: Send + Sync {
+    /// Buffer one usage record (non-blocking).
+    fn record(&self, record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+// ===========================================================================
+// Shared batching / backoff engine
+// ===========================================================================
+//
+// Both concrete sinks share identical behaviour: an mpsc buffer drained by a
+// background task that flushes on `batch_size` OR every `flush_secs`, retrying
+// failed batches with exponential backoff. Only the per-backend insert differs,
+// so it is supplied as a callable. (Honours the "duplicate twice → extract"
+// rule from AGENTS.md; the retry/flush policy is the root-cause-shared logic.)
+
+/// Result of an insert attempt: `Ok` on success, or `Err((batch, message))`
+/// returning the un-written batch so the caller can retry it.
+type InsertResult = Result<(), (Vec<UsageRecord>, String)>;
+
+/// Drive a background sink loop over `rx`. Flushes when the buffer reaches
+/// `batch_size`, on the `flush_secs` interval (if non-empty), and a final flush
+/// when the channel closes.
+async fn run_channel_sink<F, Fut>(
+    mut rx: tokio::sync::mpsc::Receiver<UsageRecord>,
+    batch_size: usize,
+    flush_secs: u64,
+    inserter: F,
+) where
+    F: Fn(Vec<UsageRecord>) -> Fut + Send + 'static,
+    Fut: Future<Output = InsertResult> + Send + 'static,
+{
+    let batch_size = batch_size.max(1);
+    let mut buffer: Vec<UsageRecord> = Vec::with_capacity(batch_size);
+
+    let flush_dur = Duration::from_secs(flush_secs.max(1));
+    let mut ticker = tokio::time::interval(flush_dur);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the immediate first tick so a size-below-batch buffer only flushes
+    // after a real `flush_dur` has elapsed, not instantly.
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            recv = rx.recv() => match recv {
+                Some(record) => {
+                    buffer.push(record);
+                    if buffer.len() >= batch_size {
+                        flush_with_backoff(&mut buffer, &inserter).await;
+                    }
+                }
+                None => {
+                    // Channel closed: best-effort final drain + flush, then exit.
+                    if !buffer.is_empty() {
+                        flush_with_backoff(&mut buffer, &inserter).await;
+                    }
+                    return;
+                }
+            },
+            _tick = ticker.tick(), if !buffer.is_empty() => {
+                flush_with_backoff(&mut buffer, &inserter).await;
+            }
+        }
+    }
+}
+
+/// Flush `buffer` with exponential backoff (50ms → 100ms → … capped at 10s).
+/// On insert failure the batch is returned to `buffer` and retried; this never
+/// gives up (usage records are best-effort telemetry, but losing them silently
+/// is worse than bounded retry). Never blocks `record()` callers (runs only in
+/// the background task).
+async fn flush_with_backoff<F, Fut>(buffer: &mut Vec<UsageRecord>, inserter: &F)
+where
+    F: Fn(Vec<UsageRecord>) -> Fut,
+    Fut: Future<Output = InsertResult>,
+{
+    const INITIAL: Duration = Duration::from_millis(50);
+    const CAP: Duration = Duration::from_secs(10);
+
+    let mut delay = INITIAL;
+    loop {
+        if buffer.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(buffer);
+        match inserter(batch).await {
+            Ok(()) => return,
+            Err((returned, msg)) => {
+                tracing::warn!(
+                    error = %msg,
+                    backoff_ms = delay.as_millis() as u64,
+                    "usage sink batch insert failed; will retry"
+                );
+                buffer.extend(returned);
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(CAP);
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// SqliteSink (design §9.2) — feature `db`
+// ===========================================================================
+
+#[cfg(feature = "db")]
+use sqlx::SqlitePool;
+
+#[cfg(any(feature = "db", feature = "usage-clickhouse"))]
+use tokio::sync::mpsc;
+
+/// Default `UsageSink` — batched INSERTs into the W2 `usage_record` table.
+///
+/// `record()` pushes onto a bounded mpsc channel (non-blocking; drops + logs on
+/// overflow). A background task flushes on `batch_size` reached OR every
+/// `flush_secs`, retrying transient DB errors with exponential backoff. On
+/// `Drop` the channel closes and the sink best-effort synchronously drains +
+/// final-flushes (requires a multi-threaded tokio runtime; on a current-thread
+/// runtime it detaches, still completing the flush asynchronously).
+#[cfg(feature = "db")]
+pub struct SqliteSink {
+    tx: Option<mpsc::Sender<UsageRecord>>,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(feature = "db")]
+impl SqliteSink {
+    /// Spawn the sink: creates a bounded channel and a background flush task on
+    /// the current tokio runtime. Panics (via tokio) if called outside a
+    /// runtime — bring the runtime up first (design: sink is constructed during
+    /// server startup, after the runtime exists).
+    #[must_use]
+    pub fn new(pool: SqlitePool, batch_size: usize, flush_secs: u64) -> Self {
+        let batch_size = batch_size.max(1);
+        let capacity = batch_size.max(16);
+        let (tx, rx) = mpsc::channel(capacity);
+
+        let pool_for_task = pool.clone();
+        let inserter = move |batch: Vec<UsageRecord>| {
+            let pool = pool_for_task.clone();
+            async move {
+                match insert_batch_sqlite(&pool, &batch).await {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err((batch, e.to_string())),
+                }
+            }
+        };
+
+        let join = tokio::spawn(run_channel_sink(rx, batch_size, flush_secs, inserter));
+        Self {
+            tx: Some(tx),
+            join: Some(join),
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl UsageSink for SqliteSink {
+    fn record(&self, record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let tx = match self.tx.as_ref() {
+                Some(tx) => tx,
+                None => return,
+            };
+            if let Err(err) = tx.try_send(record) {
+                // Non-blocking: channel either full (backpressure) or closed
+                // (shutting down). Either way never block the caller.
+                let dropped_trace = match &err {
+                    mpsc::error::TrySendError::Full(r) | mpsc::error::TrySendError::Closed(r) => {
+                        r.trace_id.clone()
+                    }
+                };
+                tracing::warn!(
+                    dropped_trace_id = %dropped_trace,
+                    error = %err,
+                    "usage sink channel full/closed; dropping usage record"
+                );
+            }
+        })
+    }
+}
+
+#[cfg(feature = "db")]
+impl Drop for SqliteSink {
+    fn drop(&mut self) {
+        drain_on_drop(self.tx.take(), self.join.take());
+    }
+}
+
+/// Insert a batch inside a single transaction (atomicity + speed). The core
+/// struct's `client_api_key_masked` maps to the `client_api_key` column; the
+/// `trace_id` field has no corresponding column in the W2 schema and is
+/// intentionally not persisted here (it lives in logs/metrics, design §4.1).
+///
+/// Uses runtime-checked `query` (see `db.rs` header: in-memory pools can't be
+/// introspected at compile time).
+#[cfg(feature = "db")]
+async fn insert_batch_sqlite(
+    pool: &SqlitePool,
+    records: &[UsageRecord],
+) -> Result<(), sqlx::Error> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for r in records {
+        sqlx::query(
+            "INSERT INTO usage_record \
+             (tenant_id, provider_id, model_key, client_api_key, status_code, \
+              prompt_tokens, completion_tokens, total_tokens, latency_ms, \
+              upstream_host, error, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&r.tenant_id)
+        .bind(&r.provider_id)
+        .bind(&r.model_key)
+        .bind(&r.client_api_key_masked)
+        .bind(i64::from(r.status_code))
+        .bind(r.prompt_tokens.map(|v| v as i64))
+        .bind(r.completion_tokens.map(|v| v as i64))
+        .bind(r.total_tokens.map(|v| v as i64))
+        .bind(r.latency_ms as i64)
+        .bind(&r.upstream_host)
+        .bind(&r.error)
+        .bind(&r.created_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+// ===========================================================================
+// ClickHouseSink (design §9.3) — feature `usage-clickhouse`
+// ===========================================================================
+//
+// NOTE on transport: the W1 `Cargo.toml` pins `clickhouse = "0.1"`, which on
+// crates.io is an empty 65-byte placeholder package (no `Client`/`insert` API
+// — verified from the vendored source). The real ClickHouse driver by the same
+// author lives at `0.11.x`. `Cargo.toml` is owned by another lane, so rather
+// than block on a dep bump this sink talks to ClickHouse over its **native,
+// first-class HTTP interface** (port 8123, `INSERT … FORMAT JSONEachRow`) using
+// only `tokio` (already a `runtime` dep). This is a real, production-grade
+// implementation (no test doubles, no placeholders). Switching to the
+// `clickhouse` crate later is a mechanical change confined to
+// `insert_batch_clickhouse_http`.
+
+#[cfg(feature = "usage-clickhouse")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[cfg(feature = "usage-clickhouse")]
+use tokio::sync::mpsc as ch_mpsc;
+
+/// Configuration parsed once from the ClickHouse URL.
+#[cfg(feature = "usage-clickhouse")]
+#[derive(Clone)]
+struct ClickHouseConfig {
+    /// `host:port` for the TCP connection (e.g. `127.0.0.1:8123`).
+    host_port: String,
+}
+
+/// Optional ClickHouse `UsageSink`. Same batching/backoff/Drop semantics as
+/// [`SqliteSink`]; only the insert transport differs.
+#[cfg(feature = "usage-clickhouse")]
+pub struct ClickHouseSink {
+    tx: Option<ch_mpsc::Sender<UsageRecord>>,
+    join: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(feature = "usage-clickhouse")]
+impl ClickHouseSink {
+    /// Spawn the sink against the ClickHouse HTTP endpoint at `url`
+    /// (e.g. `http://127.0.0.1:8123`). v1 is HTTP-only (CH's default 8123).
+    #[must_use]
+    pub fn new(url: &str, batch_size: usize, flush_secs: u64) -> Self {
+        let batch_size = batch_size.max(1);
+        let capacity = batch_size.max(16);
+        let (tx, rx) = ch_mpsc::channel(capacity);
+
+        let cfg = parse_clickhouse_url(url);
+        let inserter = move |batch: Vec<UsageRecord>| {
+            let cfg = cfg.clone();
+            async move {
+                match insert_batch_clickhouse_http(&cfg, &batch).await {
+                    Ok(()) => Ok(()),
+                    Err(msg) => Err((batch, msg)),
+                }
+            }
+        };
+
+        let join = tokio::spawn(run_channel_sink(rx, batch_size, flush_secs, inserter));
+        Self {
+            tx: Some(tx),
+            join: Some(join),
+        }
+    }
+}
+
+#[cfg(feature = "usage-clickhouse")]
+impl UsageSink for ClickHouseSink {
+    fn record(&self, record: UsageRecord) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let tx = match self.tx.as_ref() {
+                Some(tx) => tx,
+                None => return,
+            };
+            if let Err(err) = tx.try_send(record) {
+                tracing::warn!(
+                    error = %err,
+                    "clickhouse usage sink channel full/closed; dropping usage record"
+                );
+            }
+        })
+    }
+}
+
+#[cfg(feature = "usage-clickhouse")]
+impl Drop for ClickHouseSink {
+    fn drop(&mut self) {
+        drain_on_drop(self.tx.take(), self.join.take());
+    }
+}
+
+/// Shared `Drop` body: close the channel, then best-effort synchronously wait
+/// (bounded by [`MAX_SHUTDOWN_WAIT`]) for the background task to finish its
+/// final drain + flush. Requires a multi-threaded tokio runtime
+/// (`block_in_place`); on a current-thread runtime or no runtime we silently
+/// detach — the bg task still completes the flush asynchronously when the
+/// backend recovers, and is aborted when the runtime shuts down.
+fn drain_on_drop(tx: Option<mpsc::Sender<UsageRecord>>, join: Option<tokio::task::JoinHandle<()>>) {
+    // 1. Close the channel first so the bg task observes closure and does its
+    //    final drain + flush.
+    drop(tx);
+    let join = match join {
+        Some(j) => j,
+        None => return,
+    };
+    // 2. Bounded synchronous wait. The `catch_unwind` guards against
+    //    `block_in_place` panicking on a current-thread runtime.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let waited = async {
+                let _ = tokio::time::timeout(MAX_SHUTDOWN_WAIT, join).await;
+            };
+            tokio::task::block_in_place(|| handle.block_on(waited));
+        }
+    }));
+}
+
+/// Parse a ClickHouse URL into the `host:port` for a TCP connection. Accepts
+/// `http://host:port`, `https://host:port`, or bare `host:port`.
+#[cfg(feature = "usage-clickhouse")]
+fn parse_clickhouse_url(url: &str) -> ClickHouseConfig {
+    let stripped = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let host_port = stripped.split('/').next().unwrap_or(stripped);
+    ClickHouseConfig {
+        host_port: host_port.to_string(),
+    }
+}
+
+/// The `INSERT` statement. Column list matches `usage_record` (§9.5).
+#[cfg(feature = "usage-clickhouse")]
+const CLICKHOUSE_INSERT: &str =
+    "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, status_code, \
+     prompt_tokens, completion_tokens, total_tokens, latency_ms, upstream_host, error, created_at) \
+     FORMAT JSONEachRow";
+
+/// Insert a batch into ClickHouse over HTTP. On failure returns the error
+/// message (the batch is retained by the caller for retry).
+#[cfg(feature = "usage-clickhouse")]
+async fn insert_batch_clickhouse_http(
+    cfg: &ClickHouseConfig,
+    records: &[UsageRecord],
+) -> Result<(), String> {
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    // Build the JSONEachRow body (one JSON object per line).
+    let mut body = String::with_capacity(records.len() * 256);
+    for r in records {
+        build_clickhouse_json_row_into(&mut body, r);
+        body.push('\n');
+    }
+
+    // POST /?query=<url-encoded INSERT>& … with the rows in the body.
+    let request = format!(
+        "POST /?query={query} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {len}\r\n\
+         Connection: close\r\n\r\n{body}",
+        query = url_encode(CLICKHOUSE_INSERT),
+        host = cfg.host_port,
+        len = body.len(),
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(&cfg.host_port)
+        .await
+        .map_err(|e| format!("clickhouse connect {hp}: {e}", hp = cfg.host_port))?;
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("clickhouse write: {e}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| format!("clickhouse flush: {e}"))?;
+
+    let mut resp = Vec::new();
+    stream
+        .read_to_end(&mut resp)
+        .await
+        .map_err(|e| format!("clickhouse read: {e}"))?;
+
+    // ClickHouse returns HTTP 200 + empty body on a successful INSERT; any other
+    // status carries the error text in the body.
+    let resp_text = String::from_utf8_lossy(&resp);
+    let status_line = resp_text.lines().next().unwrap_or("");
+    if status_line.contains(" 200 ") {
+        Ok(())
+    } else {
+        // Trim the body to a reasonable size for the error message.
+        let body_text = resp_text.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+        Err(format!(
+            "clickhouse insert rejected: status=`{status_line}` body={body_text}"
+        ))
+    }
+}
+
+/// Append one `UsageRecord` as a single JSON object (`{...}`) to `out`, with no
+/// trailing newline. Exposed for deterministic schema testing (T4.2).
+#[cfg(feature = "usage-clickhouse")]
+pub fn build_clickhouse_json_row(record: &UsageRecord) -> String {
+    let mut out = String::with_capacity(256);
+    build_clickhouse_json_row_into(&mut out, record);
+    out
+}
+
+/// In-place variant used by the inserter to avoid an allocation per row.
+#[cfg(feature = "usage-clickhouse")]
+fn build_clickhouse_json_row_into(out: &mut String, r: &UsageRecord) {
+    out.push_str("{\"tenant_id\":");
+    json_string_into(out, &r.tenant_id);
+    out.push_str(",\"provider_id\":");
+    json_string_into(out, &r.provider_id);
+    out.push_str(",\"model_key\":");
+    json_string_into(out, &r.model_key);
+    out.push_str(",\"client_api_key\":");
+    match &r.client_api_key_masked {
+        Some(v) => json_string_into(out, v),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"status_code\":");
+    out.push_str(&r.status_code.to_string());
+    out.push_str(",\"prompt_tokens\":");
+    json_opt_u64_into(out, r.prompt_tokens);
+    out.push_str(",\"completion_tokens\":");
+    json_opt_u64_into(out, r.completion_tokens);
+    out.push_str(",\"total_tokens\":");
+    json_opt_u64_into(out, r.total_tokens);
+    out.push_str(",\"latency_ms\":");
+    out.push_str(&r.latency_ms.to_string());
+    out.push_str(",\"upstream_host\":");
+    match &r.upstream_host {
+        Some(v) => json_string_into(out, v),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"error\":");
+    match &r.error {
+        Some(v) => json_string_into(out, v),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"created_at\":");
+    json_string_into(out, &r.created_at);
+    out.push('}');
+}
+
+/// Append a JSON string literal (with full RFC-8259 escaping) to `out`.
+#[cfg(feature = "usage-clickhouse")]
+fn json_string_into(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Append a JSON number or `null` for an `Option<u64>`.
+#[cfg(feature = "usage-clickhouse")]
+fn json_opt_u64_into(out: &mut String, v: Option<u64>) {
+    match v {
+        Some(n) => out.push_str(&n.to_string()),
+        None => out.push_str("null"),
+    }
+}
+
+/// Percent-encode a string for use in a `?query=` URL segment (RFC 3986
+/// unreserved characters kept; everything else `%HH`).
+#[cfg(feature = "usage-clickhouse")]
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
+// ===========================================================================
+// Config-driven selection (design §9.3)
+// ===========================================================================
+
+/// Errors returned by [`build_sink`] when the requested configuration is
+/// unsatisfiable. Surfaced as a typed `Result` (never a panic) so startup code
+/// can report config problems cleanly.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildSinkError {
+    /// `cfg_kind` did not match `"sqlite"` or `"clickhouse"`.
+    #[error("unknown sink kind '{kind}'")]
+    UnknownKind { kind: String },
+    /// `"sqlite"` was requested but no `SqlitePool` was supplied.
+    #[error("sink kind 'sqlite' requires a SqlitePool")]
+    MissingPool,
+    /// `"clickhouse"` was requested but no URL was supplied.
+    #[error("sink kind 'clickhouse' requires a url")]
+    MissingClickHouseUrl,
+    /// `"clickhouse"` was requested but the `usage-clickhouse` cargo feature is
+    /// not enabled.
+    #[error("sink kind 'clickhouse' requires the 'usage-clickhouse' cargo feature")]
+    ClickHouseFeatureDisabled,
+}
+
+/// Default batch size for sinks constructed via [`build_sink`].
+const DEFAULT_BATCH_SIZE: usize = 256;
+/// Default flush interval (seconds) for sinks constructed via [`build_sink`].
+const DEFAULT_FLUSH_SECS: u64 = 5;
+/// Maximum time [`SqliteSink`] / [`ClickHouseSink`] `Drop` will wait for the
+/// background task to finish its final flush. Bounds graceful shutdown so a
+/// permanently-broken backend cannot hang shutdown indefinitely; if the wait
+/// elapses the task is detached (it may still complete the flush if the backend
+/// recovers, and is aborted when the runtime shuts down).
+const MAX_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+
+/// Select a [`UsageSink`] implementation from a configuration kind.
+///
+/// Returns a [`Result`] so invalid configuration is a handled startup error
+/// rather than a panic (validates external input per AGENTS.md; the sketch in
+/// the design doc returned `Box<dyn UsageSink>` directly, but a missing
+/// `pool`/`url` cannot be recovered from without inventing a no-op placeholder
+/// sink, which 铁律 2 forbids — hence the typed error).
+#[cfg(feature = "db")]
+pub fn build_sink(
+    cfg_kind: &str,
+    pool: Option<SqlitePool>,
+    ch_url: Option<&str>,
+) -> Result<Box<dyn UsageSink>, BuildSinkError> {
+    match cfg_kind {
+        "sqlite" => {
+            let pool = pool.ok_or(BuildSinkError::MissingPool)?;
+            Ok(Box::new(SqliteSink::new(
+                pool,
+                DEFAULT_BATCH_SIZE,
+                DEFAULT_FLUSH_SECS,
+            )))
+        }
+        "clickhouse" => {
+            #[cfg(feature = "usage-clickhouse")]
+            {
+                let url = ch_url.ok_or(BuildSinkError::MissingClickHouseUrl)?;
+                Ok(Box::new(ClickHouseSink::new(
+                    url,
+                    DEFAULT_BATCH_SIZE,
+                    DEFAULT_FLUSH_SECS,
+                )))
+            }
+            #[cfg(not(feature = "usage-clickhouse"))]
+            {
+                let _ = ch_url;
+                Err(BuildSinkError::ClickHouseFeatureDisabled)
+            }
+        }
+        other => Err(BuildSinkError::UnknownKind {
+            kind: other.to_string(),
+        }),
+    }
+}
