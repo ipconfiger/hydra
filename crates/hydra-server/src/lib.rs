@@ -47,8 +47,11 @@ pub mod sink;
 /// `ProxyHttp` impl wiring core fns to Pingora hooks.
 #[cfg(feature = "proxy")]
 pub mod proxy;
-/// `HydraCertStore` — multi-tenant dynamic SNI certificate callback.
-#[cfg(feature = "proxy")]
+/// `HydraCertStore` — multi-tenant dynamic SNI certificate callback (design
+/// §12). Only compiled when a TLS backend (`tls-boringssl` / `tls-openssl`) is
+/// enabled: it uses the pingora `x509`/`pkey`/`ssl`/`ext` types that exist only
+/// under a real backend (plain `proxy` links the `noop_tls` stub instead).
+#[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
 pub mod tls;
 
 // --- W5: admin service & observability ------------------------------------

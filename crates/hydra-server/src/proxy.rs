@@ -186,6 +186,11 @@ impl ProxyHttp for HydraProxy {
             .get("host")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
+        // §12.3 SNI/Host mismatch observation (never blocks): the cert was
+        // selected by TLS SNI; compare it against the Host-derived domain and
+        // bump `hydra_sni_host_mismatch_total` on mismatch. Additive only.
+        #[cfg(any(feature = "tls-boringssl", feature = "tls-openssl"))]
+        crate::tls::observe_sni_host_mismatch(session, host);
         let Some(tenant) = Self::resolve_tenant(cfg, host) else {
             return short_circuit(session, 404, "unknown_domain").await;
         };
