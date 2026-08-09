@@ -29,6 +29,17 @@ pub struct Provider {
     pub weight: i32,
     pub created_at: String,
     pub updated_at: String,
+    /// Max in-flight requests to this provider. `None` ⇒ use `ProxyConfig`
+    /// default / unlimited (design-admission-queue §5). Opt-in per provider.
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+    /// Max requests waiting for a permit. `None` ⇒ default. `0` ⇒ fail-fast
+    /// (no queue, 503/failover on cap).
+    #[serde(default)]
+    pub max_queue_depth: Option<u32>,
+    /// Max wait in the queue before failover/503 (ms). `None` ⇒ default.
+    #[serde(default)]
+    pub queue_wait_timeout_ms: Option<u64>,
 }
 
 /// A model served by a provider. `status`: `1` online / `0` manually offline /
@@ -44,7 +55,9 @@ pub struct ProviderModel {
     pub status: i32,
 }
 
-/// A real api-key for a provider (stored plaintext by necessity; see §16.2).
+/// A real api-key for a provider. The `api_key` field is held in memory only
+/// (plaintext); it is persisted as AES-256-GCM ciphertext (see
+/// `hydra-server::crypto`). Decryption happens at the DB boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderKey {
     pub id: String,

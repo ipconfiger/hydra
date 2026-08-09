@@ -57,7 +57,7 @@ runtime = [
     "dep:serde",
     "dep:serde_json",
 ]
-db = ["runtime", "dep:sqlx"]
+db = ["runtime", "dep:sqlx", "dep:aes-gcm", "dep:base64", "dep:rand"]
 http-client = ["runtime", "dep:reqwest"]
 # `proxy` now implies `db` + `http-client`: the proxy shell uses ConfigStore
 # (W2) and reqwest (W3 auth upstream + W4 breaker probe), so `--features proxy`
@@ -113,6 +113,12 @@ include_dir = { version = "0.7", optional = true }
 # W5 admin REST API (design §13): JSON encode/decode for entities + own types.
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+
+# --- At-rest encryption (provider api-keys, design §16.2) ------------------
+# Gated behind `db` (the encrypt-on-write boundary lives in `db.rs`). Pure-safe
+# Rust; does NOT touch the hydra-core dependency firewall.
+aes-gcm = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
 
 # --- Optional sink --------------------------------------------------------
 clickhouse = { version = "0.1", optional = true }

@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use hydra_core::breaker::BreakerConfig;
+use hydra_core::config::ConcurrencyPolicy;
 
 /// Behaviour for requests that have no parseable `model` field (§6.3a).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,6 +77,12 @@ pub struct ProxyConfig {
     pub failover: FailoverConfig,
     /// Breaker policy.
     pub breaker: BreakerPolicy,
+    /// Default per-provider concurrency admission policy
+    /// (design-admission-queue §5). Applied via `resolve_policy` when a
+    /// provider leaves a field as `None`. The safe-rollout default is all
+    /// zeros: `max_concurrency == 0` ⇒ `Permit::Passthrough` (no gating, no
+    /// behaviour change for unconfigured providers — risk #1).
+    pub default_concurrency_policy: ConcurrencyPolicy,
 }
 
 impl Default for ProxyConfig {
@@ -86,6 +93,15 @@ impl Default for ProxyConfig {
             non_route_strategy: NonRouteStrategy::Passthrough,
             failover: FailoverConfig::default(),
             breaker: BreakerPolicy::default(),
+            // CRITICAL SAFETY PROPERTY: all zeros ⇒ `max_concurrency == 0` ⇒
+            // every unconfigured provider gets `Permit::Passthrough` (no gate,
+            // no block, no semaphore). This is the no-op default that preserves
+            // the hot path for providers without configured concurrency limits.
+            default_concurrency_policy: ConcurrencyPolicy {
+                max_concurrency: 0,
+                max_queue_depth: 0,
+                queue_wait_timeout_ms: 0,
+            },
         }
     }
 }

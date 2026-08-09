@@ -24,6 +24,9 @@ fn provider(id: &str, weight: i32) -> Provider {
         weight,
         created_at: "2026-01-01T00:00:00Z".into(),
         updated_at: "2026-01-01T00:00:00Z".into(),
+        max_concurrency: None,
+        max_queue_depth: None,
+        queue_wait_timeout_ms: None,
     }
 }
 

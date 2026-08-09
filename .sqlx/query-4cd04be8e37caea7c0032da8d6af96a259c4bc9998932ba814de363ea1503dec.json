@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id as \"id!\", provider_id, created_at, api_key_ciphertext, api_key_nonce,\n                  key_version\n           FROM provider_key ORDER BY provider_id, created_at",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "provider_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "api_key_ciphertext",
+        "ordinal": 3,
+        "type_info": "Blob"
+      },
+      {
+        "name": "api_key_nonce",
+        "ordinal": 4,
+        "type_info": "Blob"
+      },
+      {
+        "name": "key_version",
+        "ordinal": 5,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "4cd04be8e37caea7c0032da8d6af96a259c4bc9998932ba814de363ea1503dec"
+}

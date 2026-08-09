@@ -28,6 +28,10 @@
 #![forbid(unsafe_code)]
 
 // --- W2: persistence & config store ---------------------------------------
+/// At-rest encryption for persisted secrets (provider upstream api-keys).
+/// Gated on `db` (the encrypt-on-write / decrypt-on-read boundary is `db.rs`).
+#[cfg(feature = "db")]
+pub mod crypto;
 /// sqlx pool, migrations, and the repo layer.
 #[cfg(feature = "db")]
 pub mod db;

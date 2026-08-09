@@ -61,6 +61,7 @@ Hydra boots from **environment variables** (runtime) and stores all routing conf
 | `HYDRA_LISTEN`       | `0.0.0.0:8080`                   | Proxy listen address (use `:443` + certs for TLS)    |
 | `HYDRA_ADMIN_ADDR`   | `127.0.0.1:8081`                 | Admin REST + UI + `/metrics` listen address          |
 | `HYDRA_ADMIN_TOKEN`  | —                                | Bearer token gating `/api/v1/*` (**required for admin**) |
+| `HYDRA_ENCRYPTION_KEY` | —                              | Base64 of 32 bytes; encrypts provider api-keys at rest (**required**, fail-closed). Generate: `openssl rand 32 \| base64`. |
 | `HYDRA_USAGE_SINK`   | `sqlite`                         | `sqlite` or `clickhouse`                             |
 | `HYDRA_CLICKHOUSE_URL` | —                              | ClickHouse HTTP endpoint (when sink=clickhouse)      |
 | `RUST_LOG`           | `info`                           | Log level                                            |

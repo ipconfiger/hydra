@@ -61,6 +61,7 @@ Hydra 通过**环境变量**启动（运行时），所有路由配置存于 **S
 | `HYDRA_LISTEN`         | `0.0.0.0:8080`                   | 代理监听地址（配证书时用 `:443` 走 TLS）            |
 | `HYDRA_ADMIN_ADDR`     | `127.0.0.1:8081`                 | 管理 REST + UI + `/metrics` 监听地址                |
 | `HYDRA_ADMIN_TOKEN`    | —                                | 守护 `/api/v1/*` 的 Bearer token（**管理必填**）     |
+| `HYDRA_ENCRYPTION_KEY` | —                                | 32 字节的 base64；落库加密 provider api-key（**必填**，缺失即拒启动）。生成：`openssl rand 32 \| base64` |
 | `HYDRA_USAGE_SINK`     | `sqlite`                         | `sqlite` 或 `clickhouse`                            |
 | `HYDRA_CLICKHOUSE_URL` | —                                | ClickHouse HTTP 端点（sink=clickhouse 时必填）      |
 | `RUST_LOG`             | `info`                           | 日志级别                                            |

@@ -8,10 +8,16 @@ use hydra_core::config::{validate, Severity};
 use hydra_core::model::{
     LimitRole, Provider, ProviderKey, ProviderModel, Tenant, TenantModel, TenantProvider,
 };
+use hydra_server::crypto::StaticKeyProvider;
 use hydra_server::{db as repo, store::build_config};
 
 fn now() -> &'static str {
     "2026-01-01 00:00:00"
+}
+
+/// Deterministic test key provider (never reads from the environment).
+fn kp() -> StaticKeyProvider {
+    StaticKeyProvider::new([1u8; 32], 1)
 }
 
 fn provider(id: &str, key: &str, weight: i32) -> Provider {
@@ -23,6 +29,9 @@ fn provider(id: &str, key: &str, weight: i32) -> Provider {
         weight,
         created_at: now().into(),
         updated_at: now().into(),
+        max_concurrency: None,
+        max_queue_depth: None,
+        queue_wait_timeout_ms: None,
     }
 }
 
@@ -71,6 +80,7 @@ async fn seed(pool: &sqlx::SqlitePool) {
         .expect("m3 offline");
     repo::insert_provider_key(
         pool,
+        &kp(),
         &ProviderKey {
             id: "k1".into(),
             provider_id: "p1".into(),
@@ -82,6 +92,7 @@ async fn seed(pool: &sqlx::SqlitePool) {
     .expect("k1");
     repo::insert_provider_key(
         pool,
+        &kp(),
         &ProviderKey {
             id: "k2".into(),
             provider_id: "p2".into(),
@@ -132,7 +143,7 @@ async fn loader_build_indexes_correct() {
     let pool = common::setup_pool().await;
     seed(&pool).await;
 
-    let cfg = build_config(&pool).await.expect("build");
+    let cfg = build_config(&pool, &kp()).await.expect("build");
 
     // providers
     assert_eq!(cfg.providers.len(), 2);
@@ -202,7 +213,7 @@ async fn loader_filters_offline_models() {
         .await
         .expect("probe offline (status=-1)");
 
-    let cfg = build_config(&pool).await.expect("build");
+    let cfg = build_config(&pool, &kp()).await.expect("build");
 
     // online gpt-4 present.
     let gpt4 = cfg.models_by_key.get("gpt-4").expect("online gpt-4");
@@ -228,7 +239,7 @@ async fn loader_lowercase_domain() {
     t.domain = "Foo.COM".into();
     repo::insert_tenant(&pool, &t).await.expect("insert");
 
-    let cfg = build_config(&pool).await.expect("build");
+    let cfg = build_config(&pool, &kp()).await.expect("build");
     assert!(
         cfg.tenants_by_domain.contains_key("foo.com"),
         "domain must be lowercased to 'foo.com'; got keys {:?}",
@@ -245,7 +256,7 @@ async fn loader_localhost_tenant() {
         .await
         .expect("insert localhost tenant");
 
-    let cfg = build_config(&pool).await.expect("build");
+    let cfg = build_config(&pool, &kp()).await.expect("build");
     assert!(
         cfg.tenants_by_domain.contains_key("localhost"),
         "localhost tenant must be present in tenants_by_domain"
@@ -277,7 +288,7 @@ async fn loader_runs_core_validate_warn() {
     .await
     .expect("insert unserved tenant_model");
 
-    let cfg = build_config(&pool)
+    let cfg = build_config(&pool, &kp())
         .await
         .expect("warn issues must not abort build");
 
@@ -302,7 +313,7 @@ async fn loader_cert_meta_from_paths() {
     t.cert_key = Some("/etc/hydra/secure.key".into());
     repo::insert_tenant(&pool, &t).await.expect("insert");
 
-    let cfg = build_config(&pool).await.expect("build");
+    let cfg = build_config(&pool, &kp()).await.expect("build");
     let cert = cfg.certs.get("secure.com").expect("cert meta present");
     assert_eq!(cert.domain, "secure.com");
     assert_eq!(cert.cert_file.as_deref(), Some("/etc/hydra/secure.crt"));
@@ -312,7 +323,7 @@ async fn loader_cert_meta_from_paths() {
     repo::insert_tenant(&pool, &tenant_full("t2", "plain.com"))
         .await
         .expect("plain tenant");
-    let cfg2 = build_config(&pool).await.expect("build2");
+    let cfg2 = build_config(&pool, &kp()).await.expect("build2");
     assert!(!cfg2.certs.contains_key("plain.com"));
 }
 
@@ -342,7 +353,7 @@ async fn loader_excludes_disabled_limit_roles() {
     repo::insert_limit_role(&pool, &on).await.expect("on");
     repo::insert_limit_role(&pool, &off).await.expect("off");
 
-    let cfg = build_config(&pool).await.expect("build");
+    let cfg = build_config(&pool, &kp()).await.expect("build");
     assert_eq!(cfg.limit_roles.len(), 1);
     assert_eq!(cfg.limit_roles[0].id, "lr_on");
 }

@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use hydra_core::breaker::BreakerConfig;
 use hydra_server::admin::{AdminService, AdminState};
+use hydra_server::crypto;
 use hydra_server::db;
 use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::{spawn_probe_task, CircuitBreaker};
@@ -99,8 +100,20 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     db::run_migrate(&pool).await?;
     info!(db_url = %db_url, "database pool ready");
 
-    // (2b) Config store (initial snapshot).
-    let store = ConfigStore::load(pool.clone()).await?;
+    // (2b) Master key for provider-key encryption-at-rest (fail-closed: the
+    //      process refuses to start without HYDRA_ENCRYPTION_KEY[_FILE]).
+    let static_kp =
+        crypto::StaticKeyProvider::from_env().map_err(|e| -> Box<dyn std::error::Error> {
+            format!("master key load failed: {e}").into()
+        })?;
+    info!(
+        "provider-key encryption enabled (master key version {})",
+        static_kp.version()
+    );
+    let key_provider: Arc<dyn crypto::KeyProvider> = Arc::new(static_kp);
+
+    // (2c) Config store (initial snapshot).
+    let store = ConfigStore::load(pool.clone(), key_provider.clone()).await?;
     info!("config store loaded");
 
     // (2c) Auth checker.
@@ -132,6 +145,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         auth: auth.clone(),
         breaker: breaker.clone(),
         limiter: limiter.clone(),
+        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
         proxy: proxy_cfg.clone(),
     });
@@ -160,6 +174,7 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         store,
         auth,
         breaker,
+        key_provider,
         state,
     })
 }
@@ -170,6 +185,7 @@ struct BootstrapComponents {
     store: ConfigStore,
     auth: Arc<HttpAuthChecker>,
     breaker: Arc<CircuitBreaker>,
+    key_provider: Arc<dyn crypto::KeyProvider>,
     state: Arc<AppState>,
 }
 
@@ -261,6 +277,7 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
         c.store,
         c.auth,
         c.breaker,
+        c.key_provider.clone(),
         admin_token.clone(),
         cert_reloader,
     ));

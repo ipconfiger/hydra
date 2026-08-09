@@ -9,7 +9,7 @@
 
 use hydra_core::auth::{AuthVerdict, CacheSource, Verdict};
 use hydra_core::breaker::BreakerView;
-use hydra_core::config::{CertMeta, ConfigData, ModelProvider};
+use hydra_core::config::{CertMeta, ConcurrencyPolicy, ConfigData, ModelProvider};
 use hydra_core::limit::MatchCtx;
 use hydra_core::model::{
     Candidate, LimitRole, Provider, ProviderKey, ProviderKind, ProviderModel, RouteError, Tenant,
@@ -73,6 +73,7 @@ fn public_types_are_send_sync() {
 
     assert_send_sync::<ConfigData>();
     assert_send_sync::<ModelProvider>();
+    assert_send_sync::<ConcurrencyPolicy>();
     assert_send_sync::<CertMeta>();
 
     assert_send_sync::<SwrrState>();

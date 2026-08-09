@@ -40,6 +40,9 @@ fn two_provider_cfg(weight_a: i32, weight_b: i32) -> ConfigData {
             weight: weight_a,
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
         },
     );
     cfg.providers.insert(
@@ -52,6 +55,9 @@ fn two_provider_cfg(weight_a: i32, weight_b: i32) -> ConfigData {
             weight: weight_b,
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
         },
     );
     cfg.models_by_key.insert(

@@ -18,8 +18,10 @@
 FROM --platform=linux/amd64 debian:bookworm-slim
 
 # Runtime deps. tzdata for correct timestamps; tini as PID 1 for signal handling.
+# curl is needed for the container HEALTHCHECK (see docker-compose.yml).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         libgcc-s1 \
         tini \
         tzdata \
@@ -38,7 +40,8 @@ COPY --chown=hydra:hydra bin/hydra /usr/local/bin/hydra
 RUN mkdir -p /app/data /etc/hydra && chown -R hydra:hydra /app /etc/hydra
 
 # Sensible defaults; override at `docker run` with -e / mounts.
-ENV HYDRA_DATABASE_URL=sqlite:///app/data/hydra.db \
+# NOTE: the binary reads HYDRA_DB_URL (see crates/hydra-server/src/main.rs).
+ENV HYDRA_DB_URL=sqlite:/app/data/hydra.db?mode=rwc \
     RUST_LOG=info
 
 USER hydra

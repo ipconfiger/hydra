@@ -4,8 +4,12 @@
 #   1. Build the hydra image:  ./environment/build.sh
 #   2. Copy the config template:  cp environment/config.example.json secure/config.json
 #   3. Edit secure/config.json with your real provider api-keys + endpoints.
-#   4. Start:  cd environment && docker-compose up -d
-#   5. Init:   python3 environment/init.py
+#   4. Generate the provider-key encryption master key (REQUIRED, fail-closed):
+#          export HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)"
+#      Provider api-keys are stored AES-256-GCM encrypted; without this key the
+#      container refuses to start. Keep it safe — losing it makes the DB unreadable.
+#   5. Start:  cd environment && docker-compose up -d
+#   6. Init:   python3 environment/init.py
 #
 version: "3.8"
 
@@ -23,12 +27,26 @@ services:
       HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
       HYDRA_USAGE_SINK: clickhouse
       HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
+      # Provider-key encryption master key (base64 of 32 bytes). REQUIRED — the
+      # binary fail-closes without it. ${VAR:?...} makes compose itself fail fast
+      # with this message if the operator forgot to export it.
+      HYDRA_ENCRYPTION_KEY: ${HYDRA_ENCRYPTION_KEY:?set HYDRA_ENCRYPTION_KEY="$(openssl rand 32 | base64)" — required for provider-key encryption}
       RUST_LOG: info
     volumes:
       - hydra-data:/app/data
     depends_on:
-      - clickhouse
-      - mock-tenant
+      clickhouse:
+        condition: service_healthy
+      mock-tenant:
+        condition: service_healthy
+    healthcheck:
+      # /api/v1/health requires the admin Bearer token; $$ escapes to $ so the
+      # shell expands HYDRA_ADMIN_TOKEN (set above) at healthcheck runtime.
+      test: ["CMD-SHELL", "curl -fsS -H \"Authorization: Bearer $${HYDRA_ADMIN_TOKEN}\" http://localhost:8081/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   mock-tenant:
@@ -38,6 +56,13 @@ services:
     container_name: mock-tenant
     ports:
       - "9091:9091"
+    healthcheck:
+      # Python stdlib only (no curl in the mock image); GET /health -> {"status":"ok"}
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9091/health',timeout=2).status==200 else 1)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     restart: unless-stopped
 
   clickhouse:
@@ -55,6 +80,13 @@ services:
       nofile:
         soft: 262144
         hard: 262144
+    healthcheck:
+      # clickhouse-client is bundled in the official image.
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
     restart: unless-stopped
 
 volumes:

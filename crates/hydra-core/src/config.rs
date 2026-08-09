@@ -70,6 +70,48 @@ pub struct ModelProvider {
     pub weight: i32,
 }
 
+/// Globally-resolved concurrency policy for one provider — concrete values
+/// after defaults are applied (design-admission-queue §5).
+///
+/// Lives in the pure core (no `tokio`/`Semaphore`); the concurrent shell
+/// (`hydra-server::proxy::admission`) consumes it.
+///
+/// Field semantics (matching the `Provider` overrides):
+/// - `max_concurrency == 0` ⇒ **unlimited** (do not gate this provider — the
+///   admission shell short-circuits and returns a no-op permit). This is the
+///   safe default / opt-out path.
+/// - `max_queue_depth == 0` ⇒ **fail-fast** on cap (no queue; an attempt that
+///   finds no free permit immediately returns `QueueFull`).
+/// - `queue_wait_timeout_ms` ⇒ bounded wait before a queued request gives up
+///   with `WaitTimeout`. Must be `> 0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcurrencyPolicy {
+    /// 0 ⇒ unlimited (no gating).
+    pub max_concurrency: u32,
+    /// 0 ⇒ fail-fast on cap (no queue).
+    pub max_queue_depth: u32,
+    pub queue_wait_timeout_ms: u64,
+}
+
+/// Resolve a provider's optional overrides against global defaults, field by
+/// field (design-admission-queue §5: `provider.x.unwrap_or(defaults.x)`).
+///
+/// `None` on every provider field is the documented opt-out — the result equals
+/// `defaults`, which the caller can set to "do not gate" (`max_concurrency == 0`).
+#[must_use]
+pub fn resolve_policy(
+    max_concurrency: Option<u32>,
+    max_queue_depth: Option<u32>,
+    queue_wait_timeout_ms: Option<u64>,
+    defaults: ConcurrencyPolicy,
+) -> ConcurrencyPolicy {
+    ConcurrencyPolicy {
+        max_concurrency: max_concurrency.unwrap_or(defaults.max_concurrency),
+        max_queue_depth: max_queue_depth.unwrap_or(defaults.max_queue_depth),
+        queue_wait_timeout_ms: queue_wait_timeout_ms.unwrap_or(defaults.queue_wait_timeout_ms),
+    }
+}
+
 /// W1–W2 certificate placeholder (paths only). W4 resolves these into a
 /// parsed certificate; until then the path fields stand in for validation
 /// (e.g. T9.7 "missing cert path" → fatal issue).
@@ -190,6 +232,42 @@ pub fn validate(cfg: &ConfigData) -> Vec<ValidationIssue> {
                 "limit_role '{}' has both limit_count and limit_token NULL",
                 role.id
             )));
+        }
+    }
+
+    // Per-provider concurrency overrides (design-admission-queue §5 / P0.1):
+    // a queue without a concurrency cap is meaningless, and a zero timeout is
+    // a misconfiguration.
+    for provider in cfg.providers.values() {
+        if let Some(depth) = provider.max_queue_depth {
+            if depth > 0 {
+                // A non-fail-fast queue requires an explicit concurrency cap.
+                match provider.max_concurrency {
+                    None => {
+                        issues.push(ValidationIssue::warn(format!(
+                            "provider '{}' sets max_queue_depth={} but no max_concurrency; \
+                             a queue without a concurrency cap is meaningless",
+                            provider.id, depth
+                        )));
+                    }
+                    Some(0) => {
+                        issues.push(ValidationIssue::warn(format!(
+                            "provider '{}' sets max_queue_depth={} but max_concurrency=0 (unlimited); \
+                             a queue without a concurrency cap is meaningless",
+                            provider.id, depth
+                        )));
+                    }
+                    Some(_) => { /* valid: cap + queue */ }
+                }
+            }
+        }
+        if let Some(wait) = provider.queue_wait_timeout_ms {
+            if wait == 0 {
+                issues.push(ValidationIssue::warn(format!(
+                    "provider '{}' sets queue_wait_timeout_ms=0; must be > 0",
+                    provider.id
+                )));
+            }
         }
     }
 

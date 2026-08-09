@@ -41,6 +41,17 @@ TEST_PY="${SCRIPT_DIR}/test_crud.py"
 # so the port is reachable from the host. (main.rs:50,242.)
 DB_URL="sqlite:/app/data/hydra.db?mode=rwc"
 
+# Provider-key encryption master key. The container fail-closes without it
+# (provider api-keys are AES-256-GCM encrypted at rest). The integration DB and
+# its keys are throwaway (re-entered by test_crud.py each run, volume torn down
+# on exit), so a fresh random key per run is correct and hermetic.
+if command -v openssl >/dev/null 2>&1; then
+    ENC_KEY="$(openssl rand 32 | base64)"
+else
+    ENC_KEY="$(python3 -c 'import os,base64; print(base64.b64encode(os.urandom(32)).decode())')"
+fi
+export HYDRA_ENCRYPTION_KEY="$ENC_KEY"
+
 # ---------------------------------------------------------------------------
 # Teardown (always runs, even on error / Ctrl-C)
 # ---------------------------------------------------------------------------
@@ -85,6 +96,7 @@ if ! docker run -d \
         -e "HYDRA_DB_URL=${DB_URL}" \
         -e "HYDRA_ADMIN_ADDR=0.0.0.0:8081" \
         -e "HYDRA_ADMIN_TOKEN=${TOKEN}" \
+        -e "HYDRA_ENCRYPTION_KEY=${ENC_KEY}" \
         "$IMAGE" >/dev/null; then
     echo "[run] !! docker run failed."
     exit 1

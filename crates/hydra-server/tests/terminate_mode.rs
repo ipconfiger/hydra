@@ -34,6 +34,7 @@ use hydra_core::model::{
     LimitRole, Provider, ProviderKey, ProviderModel, Tenant, TenantModel, TenantProvider,
     UsageRecord,
 };
+use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
 use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
@@ -95,7 +96,14 @@ async fn seed_one(pool: &sqlx::SqlitePool, auth_url: &str, upstream_endpoint: &s
     )
     .await
     .expect("insert tenant_model");
-    seed_key(pool, "pk1", "p1", "sk-upstream-secret").await;
+    seed_key(
+        pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk1",
+        "p1",
+        "sk-upstream-secret",
+    )
+    .await;
     seed_default_role(pool, "t1").await;
 }
 
@@ -110,6 +118,9 @@ async fn seed_provider(pool: &sqlx::SqlitePool, id: &str, key: &str, name: &str,
             weight: 1,
             created_at: NOW.into(),
             updated_at: NOW.into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
         },
     )
     .await
@@ -135,9 +146,16 @@ async fn seed_tenant(pool: &sqlx::SqlitePool, id: &str, domain: &str, auth_url: 
     .expect("insert tenant");
 }
 
-async fn seed_key(pool: &sqlx::SqlitePool, id: &str, provider_id: &str, api_key: &str) {
+async fn seed_key(
+    pool: &sqlx::SqlitePool,
+    kp: &StaticKeyProvider,
+    id: &str,
+    provider_id: &str,
+    api_key: &str,
+) {
     repo::insert_provider_key(
         pool,
+        kp,
         &ProviderKey {
             id: id.into(),
             provider_id: provider_id.into(),
@@ -179,7 +197,8 @@ fn ephemeral_port() -> u16 {
 
 /// Build the full AppState from a seeded pool + auth URL.
 async fn build_state(pool: &sqlx::SqlitePool) -> Arc<AppState> {
-    let store = ConfigStore::load(pool.clone())
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::load(pool.clone(), key_provider)
         .await
         .expect("ConfigStore::load");
     let auth = Arc::new(
@@ -197,6 +216,7 @@ async fn build_state(pool: &sqlx::SqlitePool) -> Arc<AppState> {
         auth,
         breaker,
         limiter,
+        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
         proxy: ProxyConfig::default(),
     })
@@ -445,12 +465,28 @@ async fn failover_advances_on_provider_error_then_breaker_records() {
     )
     .await
     .unwrap();
-    seed_key(&pool, "pk_dead", "p_dead", "sk-dead").await;
-    seed_key(&pool, "pk_live", "p_live", "sk-live").await;
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_dead",
+        "p_dead",
+        "sk-dead",
+    )
+    .await;
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk_live",
+        "p_live",
+        "sk-live",
+    )
+    .await;
     seed_default_role(&pool, "t1").await;
 
     let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
-    let store = ConfigStore::load(pool.clone()).await.unwrap();
+    let store = ConfigStore::load(pool.clone(), Arc::new(StaticKeyProvider::new([1u8; 32], 1)))
+        .await
+        .unwrap();
     let auth = Arc::new(
         HttpAuthChecker::new(
             AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
@@ -465,6 +501,7 @@ async fn failover_advances_on_provider_error_then_breaker_records() {
         auth,
         breaker: breaker.clone(),
         limiter,
+        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
         proxy: ProxyConfig::default(),
     });
@@ -561,7 +598,9 @@ async fn usage_tokens_extracted_from_response() {
 
     // Use a recording sink to verify usage extraction end-to-end.
     let recording = Arc::new(RecordingSink::default());
-    let store = ConfigStore::load(pool.clone()).await.unwrap();
+    let store = ConfigStore::load(pool.clone(), Arc::new(StaticKeyProvider::new([1u8; 32], 1)))
+        .await
+        .unwrap();
     let auth = Arc::new(
         HttpAuthChecker::new(
             AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
@@ -576,6 +615,7 @@ async fn usage_tokens_extracted_from_response() {
         auth,
         breaker,
         limiter,
+        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink: recording.clone(),
         proxy: ProxyConfig::default(),
     });
@@ -820,7 +860,9 @@ async fn rate_limit_429_even_when_routing_would_503() {
     // Build state with breaker threshold=2: after two 500s the provider enters
     // the dead-set, so routing on req3 would return NoAvailableProvider → 503
     // (old code). With the fix the limit gate fires first → 429.
-    let store = ConfigStore::load(pool.clone()).await.unwrap();
+    let store = ConfigStore::load(pool.clone(), Arc::new(StaticKeyProvider::new([1u8; 32], 1)))
+        .await
+        .unwrap();
     let auth = Arc::new(
         HttpAuthChecker::new(
             AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
@@ -836,6 +878,7 @@ async fn rate_limit_429_even_when_routing_would_503() {
         auth,
         breaker,
         limiter,
+        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
         proxy: ProxyConfig::default(),
     });
@@ -861,6 +904,385 @@ async fn rate_limit_429_even_when_routing_would_503() {
         r3.status(),
         429,
         "req3 must be 429 (rate-limited), not 503 (no provider) — the limit gate must run before routing"
+    );
+}
+
+// ===========================================================================
+// Admission control (design-admission-queue §5/§6/§7)
+// ===========================================================================
+//
+// These tests verify the safe-rollout invariants:
+//
+// 1. Default-behaviour smoke: no concurrency config ⇒ Passthrough ⇒ 200
+//    (proves the hot path is unchanged for unconfigured providers).
+// 2. §7 breaker boundary: admission errors (QueueFull/WaitTimeout) MUST NOT
+//    trip the breaker. Only real upstream errors do.
+
+/// Seed a provider with explicit concurrency limits (design-admission-queue §5).
+#[allow(clippy::too_many_arguments)]
+async fn seed_provider_capped(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    key: &str,
+    name: &str,
+    endpoint: &str,
+    max_concurrency: u32,
+    max_queue_depth: u32,
+    queue_wait_timeout_ms: u64,
+) {
+    repo::insert_provider(
+        pool,
+        &Provider {
+            id: id.into(),
+            key: key.into(),
+            name: name.into(),
+            endpoint: endpoint.into(),
+            weight: 1,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+            max_concurrency: Some(max_concurrency),
+            max_queue_depth: Some(max_queue_depth),
+            queue_wait_timeout_ms: Some(queue_wait_timeout_ms),
+        },
+    )
+    .await
+    .expect("insert capped provider");
+}
+
+/// **Default-behaviour smoke** (CRITICAL SAFETY PROPERTY): a request through
+/// the proxy with NO concurrency config (all `None`, default policy all-zeros)
+/// must succeed (200) — proving `Permit::Passthrough` short-circuits correctly
+/// and the hot path is unchanged for unconfigured providers. Also asserts no
+/// admission gate was created (Passthrough never touches the semaphore).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_no_concurrency_config_is_passthrough_200() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&auth_server)
+        .await;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"id":"ok","object":"chat.completion","choices":[]}"#),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    let state = build_state(&pool).await;
+
+    // Verify the default policy is all-zeros (⇒ Passthrough).
+    assert_eq!(
+        state.proxy.default_concurrency_policy.max_concurrency, 0,
+        "default policy must be 0 (Passthrough)"
+    );
+
+    let root = start_proxy(state.clone());
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    let resp = send_until_ready(&client, &url, r#"{"model":"gpt-4"}"#).await;
+    assert_eq!(
+        resp.status(),
+        200,
+        "default no-concurrency-config request must succeed (Passthrough no-op)"
+    );
+    let body = resp.text().await.expect("body");
+    assert!(body.contains("chat.completion"), "body: {body}");
+
+    // No admission gate should have been created (Passthrough never creates one).
+    assert_eq!(
+        state.admission.len(),
+        0,
+        "Passthrough path must not create any admission gate"
+    );
+}
+
+/// **§7 breaker boundary**: a WaitTimeout admission error MUST NOT trip the
+/// breaker. We configure a single provider with max_concurrency=1 and a short
+/// queue_wait_timeout_ms=100. The upstream has a 500ms delay so the first
+/// request holds its permit well past the second's timeout. The second request
+/// queues, times out → the loop exhausts → 503 + Retry-After. The breaker must
+/// stay at 0 failures (only real upstream errors trip it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_wait_timeout_does_not_trip_breaker() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&auth_server)
+        .await;
+
+    let upstream = MockServer::start().await;
+    // 500ms delay — the first request holds its permit for this long.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"id":"ok"}"#)
+                .set_delay(Duration::from_millis(500)),
+        )
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    // max_concurrency=1, max_queue_depth=8 (allow queueing), timeout=100ms.
+    seed_provider_capped(&pool, "p1", "openai", "OpenAI", &upstream.uri(), 1, 8, 100).await;
+    repo::insert_provider_model(
+        &pool,
+        &ProviderModel {
+            id: "m1".into(),
+            key: "gpt-4".into(),
+            name: "gpt-4".into(),
+            provider_id: "p1".into(),
+            status: 1,
+        },
+    )
+    .await
+    .expect("insert provider_model");
+    seed_tenant(
+        &pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
+    repo::insert_tenant_provider(
+        &pool,
+        &TenantProvider {
+            id: "tp1".into(),
+            tenant_id: "t1".into(),
+            provider_id: "p1".into(),
+        },
+    )
+    .await
+    .expect("insert tenant_provider");
+    repo::insert_tenant_model(
+        &pool,
+        &TenantModel {
+            id: "tm1".into(),
+            tenant_id: "t1".into(),
+            model_key: "gpt-4".into(),
+        },
+    )
+    .await
+    .expect("insert tenant_model");
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk1",
+        "p1",
+        "sk-secret",
+    )
+    .await;
+    seed_default_role(&pool, "t1").await;
+
+    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(5)));
+    let store = ConfigStore::load(pool.clone(), Arc::new(StaticKeyProvider::new([1u8; 32], 1)))
+        .await
+        .unwrap();
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .unwrap(),
+    );
+    let limiter = Arc::new(RateLimiter::new());
+    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    let state = Arc::new(AppState {
+        store,
+        auth,
+        breaker: breaker.clone(),
+        limiter,
+        admission: hydra_server::proxy::admission::AdmissionControl::new(),
+        sink,
+        proxy: ProxyConfig::default(),
+    });
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+    let body = r#"{"model":"gpt-4"}"#;
+
+    // Fire the first request — it acquires the permit and holds it for 500ms.
+    let client_a = client.clone();
+    let url_a = url.clone();
+    let body_a = body.to_string();
+    let first = tokio::spawn(async move { send_one(&client_a, &url_a, &body_a).await });
+
+    // Wait 150ms so the first request has acquired the permit.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Fire the second request — it queues, times out after 100ms → 503.
+    let second_resp = send_one(&client, &url, body).await;
+    let first_resp = first.await.expect("join first");
+
+    // The first should succeed (200); the second should be 503 (admission).
+    assert_eq!(
+        first_resp.status(),
+        200,
+        "first request (held the permit) should succeed"
+    );
+    assert_eq!(
+        second_resp.status(),
+        503,
+        "second request should be 503 (WaitTimeout — capacity exhaustion)"
+    );
+    // Verify Retry-After header is present (design §6).
+    assert!(
+        second_resp.headers().get("retry-after").is_some(),
+        "503 admission response must include Retry-After (design §6)"
+    );
+
+    // The §7 boundary: the breaker must NOT have been tripped by the admission
+    // timeout. Only a real upstream error would trip it.
+    assert_eq!(
+        breaker.fail_count("p1"),
+        0,
+        "§7: WaitTimeout MUST NOT trip the breaker (capacity ≠ health)"
+    );
+    assert!(!breaker.is_dead("p1"), "provider must not be dead");
+}
+
+/// **Admission saturation → both requests succeed**: with two providers (one
+/// capped at max_concurrency=1, one unlimited), two concurrent requests both
+/// get 200 — one via the capped provider (permit available), one via the
+/// unlimited provider (SWRR rotation or admission failover). This proves the
+/// concurrency valve composes cleanly with the existing routing/failover and
+/// does not break normal operation under concurrent load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admission_capped_provider_does_not_block_second_request() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&auth_server)
+        .await;
+
+    let upstream_a = MockServer::start().await;
+    let upstream_b = MockServer::start().await;
+
+    // Provider A: 300ms delay, capped at max_concurrency=1.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"id":"a"}"#)
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(&upstream_a)
+        .await;
+    // Provider B: instant response, unlimited.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"b"}"#))
+        .mount(&upstream_b)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_provider_capped(
+        &pool,
+        "pA",
+        "provA",
+        "ProviderA",
+        &upstream_a.uri(),
+        1,
+        8,
+        100,
+    )
+    .await;
+    seed_provider(&pool, "pB", "provB", "ProviderB", &upstream_b.uri()).await;
+    for (pid, mid) in [("pA", "mA"), ("pB", "mB")] {
+        repo::insert_provider_model(
+            &pool,
+            &ProviderModel {
+                id: mid.into(),
+                key: "gpt-4".into(),
+                name: "gpt-4".into(),
+                provider_id: pid.into(),
+                status: 1,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    seed_tenant(
+        &pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
+    for (tpid, pid) in [("tpA", "pA"), ("tpB", "pB")] {
+        repo::insert_tenant_provider(
+            &pool,
+            &TenantProvider {
+                id: tpid.into(),
+                tenant_id: "t1".into(),
+                provider_id: pid.into(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    repo::insert_tenant_model(
+        &pool,
+        &TenantModel {
+            id: "tm1".into(),
+            tenant_id: "t1".into(),
+            model_key: "gpt-4".into(),
+        },
+    )
+    .await
+    .unwrap();
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pkA",
+        "pA",
+        "sk-a",
+    )
+    .await;
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pkB",
+        "pB",
+        "sk-b",
+    )
+    .await;
+    seed_default_role(&pool, "t1").await;
+
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+    let body = r#"{"model":"gpt-4"}"#;
+
+    // Fire two concurrent requests. With SWRR rotation, the first picks one
+    // provider and the second picks the other. Both should get 200 regardless
+    // of which provider each lands on (pA has a permit, pB is unlimited).
+    let client2 = client.clone();
+    let url2 = url.clone();
+    let body2 = body.to_string();
+    let second = tokio::spawn(async move { send_one(&client2, &url2, &body2).await });
+
+    let first_resp = send_one(&client, &url, body).await;
+    let second_resp = second.await.expect("join");
+
+    let statuses = vec![first_resp.status().as_u16(), second_resp.status().as_u16()];
+    assert!(
+        statuses.iter().all(|&s| s == 200),
+        "both requests should succeed (concurrent load with capped+unlimited providers): {statuses:?}"
     );
 }
 

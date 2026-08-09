@@ -24,6 +24,7 @@ use std::time::Duration;
 use hydra_core::breaker::BreakerConfig;
 use hydra_core::config::CertMeta;
 use hydra_core::model::{Tenant, UsageRecord};
+use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
 use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
@@ -145,7 +146,10 @@ fn start_tls_server(state: Arc<AppState>, cert_store: &HydraCertStore) -> u16 {
 /// exercised here (only the TLS handshake), but a real `HydraProxy` hosts the
 /// listener — no test-only `ProxyHttp` stub.
 async fn build_state(pool: sqlx::SqlitePool) -> (ConfigStore, Arc<AppState>) {
-    let store = ConfigStore::load(pool).await.expect("ConfigStore::load");
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::load(pool, key_provider)
+        .await
+        .expect("ConfigStore::load");
     let auth = Arc::new(
         HttpAuthChecker::new(
             AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
@@ -161,6 +165,7 @@ async fn build_state(pool: sqlx::SqlitePool) -> (ConfigStore, Arc<AppState>) {
         auth,
         breaker,
         limiter,
+        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
         proxy: ProxyConfig::default(),
     });

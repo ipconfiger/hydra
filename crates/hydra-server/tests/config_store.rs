@@ -8,10 +8,16 @@ mod common;
 
 use hydra_core::model::{Provider, ProviderModel, Tenant};
 use hydra_core::swrr::SwrrState;
+use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::{db as repo, store::ConfigStore};
 
 fn now() -> &'static str {
     "2026-01-01 00:00:00"
+}
+
+/// Deterministic test key provider (never reads from the environment).
+fn kp() -> std::sync::Arc<dyn KeyProvider> {
+    std::sync::Arc::new(StaticKeyProvider::new([1u8; 32], 1))
 }
 
 fn provider(id: &str, key: &str) -> Provider {
@@ -23,6 +29,9 @@ fn provider(id: &str, key: &str) -> Provider {
         weight: 1,
         created_at: now().into(),
         updated_at: now().into(),
+        max_concurrency: None,
+        max_queue_depth: None,
+        queue_wait_timeout_ms: None,
     }
 }
 
@@ -67,7 +76,7 @@ async fn store_load_populates_arcswap() {
     let pool = common::setup_pool().await;
     seed_basic(&pool).await;
 
-    let store = ConfigStore::load(pool).await.expect("load");
+    let store = ConfigStore::load(pool, kp()).await.expect("load");
     let snap = store.snapshot();
 
     assert!(snap.providers.contains_key("p1"));
@@ -82,7 +91,7 @@ async fn store_reload_all_replaces_atomically() {
     let pool = common::setup_pool().await;
     seed_basic(&pool).await;
 
-    let store = ConfigStore::load(pool.clone()).await.expect("load");
+    let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
     let before = store.snapshot();
     assert_eq!(before.providers.len(), 1);
 
@@ -109,7 +118,7 @@ async fn store_reload_clears_swrr() {
     let pool = common::setup_pool().await;
     seed_basic(&pool).await;
 
-    let store = ConfigStore::load(pool).await.expect("load");
+    let store = ConfigStore::load(pool, kp()).await.expect("load");
 
     // Inject SWRR state as if requests had been served.
     store.swrr().insert(
@@ -137,7 +146,7 @@ async fn store_reload_validate_fail_keeps_old() {
     let pool = common::setup_pool().await;
     seed_basic(&pool).await;
 
-    let store = ConfigStore::load(pool.clone()).await.expect("load");
+    let store = ConfigStore::load(pool.clone(), kp()).await.expect("load");
     let old_providers = store.snapshot().providers.len();
 
     // Inject a provider with an unusable endpoint → fatal endpoint check.
@@ -149,6 +158,9 @@ async fn store_reload_validate_fail_keeps_old() {
         weight: 1,
         created_at: now().into(),
         updated_at: now().into(),
+        max_concurrency: None,
+        max_queue_depth: None,
+        queue_wait_timeout_ms: None,
     };
     repo::insert_provider(&pool, &bad)
         .await

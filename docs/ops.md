@@ -44,6 +44,7 @@ runtime. The release binary is the only artefact you ship.
 | Var | Default | Purpose |
 |-----|---------|---------|
 | `HYDRA_ADMIN_TOKEN` | *(unset)* | **Required.** Admin bearer token (design §13.3). Unset ⇒ admin API denies everything (fail-closed). **Never put this in `hydra.toml`.** |
+| `HYDRA_ENCRYPTION_KEY` | *(unset)* | **Required.** Base64 of 32 bytes; AES-256-GCM master key encrypting provider api-keys at rest. Unset ⇒ the binary refuses to start (fail-closed). Generate with `openssl rand 32 \| base64`. Load from an `EnvironmentFile=` (see §1.2); never inline. A matching `HYDRA_ENCRYPTION_KEY_FILE` (raw 32-byte file) is also accepted. |
 | `HYDRA_DB_URL` | `sqlite:hydra.db?mode=rwc` | SQLite path. Use `sqlite://./data/hydra.db?mode=rwc` in production. |
 | `HYDRA_LISTEN` | `0.0.0.0:8080` | Proxy listener (TLS when any tenant has certs configured, plain TCP otherwise). |
 | `HYDRA_ADMIN_ADDR` | `127.0.0.1:8081` | Admin REST + UI + `/metrics` listener. **Bind loopback only** (design §13.3). |
@@ -68,6 +69,7 @@ User=hydra
 Group=hydra
 WorkingDirectory=/opt/hydra
 Environment=HYDRA_ADMIN_TOKEN=__set_via_environment_file__
+Environment=HYDRA_ENCRYPTION_KEY=__set_via_environment_file__
 Environment=HYDRA_DB_URL=sqlite:///opt/hydra/data/hydra.db?mode=rwc
 Environment=HYDRA_LISTEN=0.0.0.0:8080
 Environment=HYDRA_ADMIN_ADDR=127.0.0.1:8081
@@ -93,8 +95,12 @@ inline it.
 
 ### 1.3 SQLite file permissions (§16.2)
 
-Provider api-keys are stored **plaintext** by necessity (they must be injected
-verbatim into upstream requests). Mitigate at the filesystem layer:
+Provider api-keys are stored **AES-256-GCM encrypted at rest** (`api_key_ciphertext` /
+`api_key_nonce` / `key_version` columns; see `hydra-server::crypto`). They are decrypted
+to plaintext only in memory, at the DB boundary, to inject verbatim into upstream
+requests. The master key (`HYDRA_ENCRYPTION_KEY`, §1.2) is the primary protection — a
+stolen DB file alone is useless without it. Filesystem hardening remains valuable as
+defense-in-depth (the encrypted blobs still should not leak):
 
 ```bash
 install -d -m 0700 -o hydra -g hydra /opt/hydra/data

@@ -34,6 +34,9 @@ fn entities_derive_roundtrip() {
         weight: 3,
         created_at: "2026-01-01T00:00:00Z".into(),
         updated_at: "2026-01-02T00:00:00Z".into(),
+        max_concurrency: None,
+        max_queue_depth: None,
+        queue_wait_timeout_ms: None,
     };
     roundtrip(&provider);
 

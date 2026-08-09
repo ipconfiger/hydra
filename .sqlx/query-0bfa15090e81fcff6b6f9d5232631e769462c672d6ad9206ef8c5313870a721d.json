@@ -1,0 +1,68 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id as \"id!\", name, domain, auth_url, cert_key, cert_file, enabled,\n                  created_at, updated_at\n           FROM tenant ORDER BY created_at",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "name",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "domain",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "auth_url",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "cert_key",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "cert_file",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "enabled",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_at",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 8,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0bfa15090e81fcff6b6f9d5232631e769462c672d6ad9206ef8c5313870a721d"
+}

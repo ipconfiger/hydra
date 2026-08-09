@@ -360,7 +360,7 @@ pub(super) async fn provider_key_collection(
 ) -> Resp {
     let reveal = query.is_some_and(|q| q.split('&').any(|kv| kv == "reveal=1"));
     if method == "GET" {
-        match crate::db::list_provider_keys(&state.pool).await {
+        match crate::db::list_provider_keys(&state.pool, state.key_provider.as_ref()).await {
             Ok(rows) => {
                 let out: Vec<ProviderKey> = if reveal {
                     tracing::info!(
@@ -393,7 +393,7 @@ pub(super) async fn provider_key_collection(
         if k.created_at.is_empty() {
             k.created_at = now_ts();
         }
-        match crate::db::insert_provider_key(&state.pool, &k).await {
+        match crate::db::insert_provider_key(&state.pool, state.key_provider.as_ref(), &k).await {
             Ok(()) => {}
             Err(e) => return db_err_resp(e, trace_id),
         }
@@ -417,14 +417,16 @@ pub(super) async fn provider_key_item(
     trace_id: &str,
 ) -> Resp {
     match method {
-        "GET" => match crate::db::get_provider_key(&state.pool, id).await {
-            Ok(mut k) => {
-                k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
-                ok_json(200, &k)
+        "GET" => {
+            match crate::db::get_provider_key(&state.pool, state.key_provider.as_ref(), id).await {
+                Ok(mut k) => {
+                    k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
+                    ok_json(200, &k)
+                }
+                Err(e) if is_not_found(&e) => err_json(404, "not_found", "key not found", trace_id),
+                Err(e) => db_err_resp(e, trace_id),
             }
-            Err(e) if is_not_found(&e) => err_json(404, "not_found", "key not found", trace_id),
-            Err(e) => db_err_resp(e, trace_id),
-        },
+        }
         "PUT" => {
             // provider_key has no dedicated update fn (W2): upsert via
             // delete + insert.
@@ -438,7 +440,8 @@ pub(super) async fn provider_key_item(
                 k.created_at = now_ts();
             }
             let _ = crate::db::delete_provider_key(&state.pool, id).await;
-            match crate::db::insert_provider_key(&state.pool, &k).await {
+            match crate::db::insert_provider_key(&state.pool, state.key_provider.as_ref(), &k).await
+            {
                 Ok(()) => {}
                 Err(e) => return db_err_resp(e, trace_id),
             }

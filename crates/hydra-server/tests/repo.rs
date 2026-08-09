@@ -5,10 +5,16 @@ mod common;
 use hydra_core::model::{
     LimitRole, Provider, ProviderKey, ProviderModel, Tenant, TenantModel, TenantProvider,
 };
+use hydra_server::crypto::StaticKeyProvider;
 use hydra_server::db as repo;
 
 fn now() -> &'static str {
     "2026-01-01 00:00:00"
+}
+
+/// Deterministic test key provider (never reads from the environment).
+fn kp() -> StaticKeyProvider {
+    StaticKeyProvider::new([1u8; 32], 1)
 }
 
 fn provider(id: &str, key: &str, weight: i32) -> Provider {
@@ -20,6 +26,9 @@ fn provider(id: &str, key: &str, weight: i32) -> Provider {
         weight,
         created_at: now().into(),
         updated_at: now().into(),
+        max_concurrency: None,
+        max_queue_depth: None,
+        queue_wait_timeout_ms: None,
     }
 }
 
@@ -174,10 +183,14 @@ async fn provider_key_crud() {
         api_key: "sk-bbb".into(),
         created_at: now().into(),
     };
-    repo::insert_provider_key(&pool, &k1).await.expect("k1");
-    repo::insert_provider_key(&pool, &k2).await.expect("k2");
+    repo::insert_provider_key(&pool, &kp(), &k1)
+        .await
+        .expect("k1");
+    repo::insert_provider_key(&pool, &kp(), &k2)
+        .await
+        .expect("k2");
 
-    let by_p = repo::list_provider_keys_by_provider(&pool, "p1")
+    let by_p = repo::list_provider_keys_by_provider(&pool, &kp(), "p1")
         .await
         .expect("list by provider");
     assert_eq!(by_p.len(), 2);
@@ -185,7 +198,7 @@ async fn provider_key_crud() {
     repo::delete_provider_key(&pool, "k1")
         .await
         .expect("del k1");
-    let after = repo::list_provider_keys_by_provider(&pool, "p1")
+    let after = repo::list_provider_keys_by_provider(&pool, &kp(), "p1")
         .await
         .expect("list after");
     assert_eq!(after.len(), 1);
@@ -193,7 +206,7 @@ async fn provider_key_crud() {
 
     // CASCADE: deleting provider removes keys.
     repo::delete_provider(&pool, "p1").await.expect("del p1");
-    let cascaded = repo::list_provider_keys_by_provider(&pool, "p1")
+    let cascaded = repo::list_provider_keys_by_provider(&pool, &kp(), "p1")
         .await
         .expect("list cascaded");
     assert!(
@@ -422,6 +435,7 @@ async fn repo_insert_then_query_roundtrip() {
         .expect("m3 offline");
     repo::insert_provider_key(
         &pool,
+        &kp(),
         &ProviderKey {
             id: "k1".into(),
             provider_id: "p1".into(),
@@ -433,6 +447,7 @@ async fn repo_insert_then_query_roundtrip() {
     .expect("k1");
     repo::insert_provider_key(
         &pool,
+        &kp(),
         &ProviderKey {
             id: "k2".into(),
             provider_id: "p2".into(),
@@ -481,7 +496,7 @@ async fn repo_insert_then_query_roundtrip() {
     assert_eq!(providers.len(), 2);
     let models = repo::list_provider_models(&pool).await.expect("models");
     assert_eq!(models.len(), 3);
-    let keys = repo::list_provider_keys(&pool).await.expect("keys");
+    let keys = repo::list_provider_keys(&pool, &kp()).await.expect("keys");
     assert_eq!(keys.len(), 2);
     let tps = repo::list_tenant_providers(&pool).await.expect("tps");
     assert_eq!(tps.len(), 2);
@@ -491,4 +506,70 @@ async fn repo_insert_then_query_roundtrip() {
     assert_eq!(tenants.len(), 1);
     assert_eq!(tenants[0].domain, "acme.com");
     assert_eq!(tenants[0].auth_url, "https://auth.acme.com/verify");
+}
+
+/// T4.9 — provider keys are encrypted at rest (AES-256-GCM).
+///
+/// The raw `api_key_ciphertext` BLOB in the DB must NOT equal the plaintext;
+/// the decrypted round-trip via `list_provider_keys` must recover it; and a
+/// different master key must fail to decrypt.
+#[tokio::test]
+async fn provider_key_encrypted_at_rest() {
+    let pool = common::setup_pool().await;
+    repo::insert_provider(&pool, &provider("p1", "openai", 1))
+        .await
+        .expect("provider");
+
+    let plaintext = "sk-secret-at-rest";
+    let kp = kp();
+    repo::insert_provider_key(
+        &pool,
+        &kp,
+        &ProviderKey {
+            id: "k1".into(),
+            provider_id: "p1".into(),
+            api_key: plaintext.into(),
+            created_at: now().into(),
+        },
+    )
+    .await
+    .expect("insert encrypted key");
+
+    // The ciphertext stored in the DB must NOT be the plaintext.
+    let row: (Vec<u8>,) =
+        sqlx::query_as("SELECT api_key_ciphertext FROM provider_key WHERE id = ?")
+            .bind("k1")
+            .fetch_one(&pool)
+            .await
+            .expect("read ciphertext column");
+    assert_ne!(
+        row.0,
+        plaintext.as_bytes(),
+        "ciphertext must not equal plaintext"
+    );
+    assert!(!row.0.is_empty(), "ciphertext must be non-empty");
+
+    // The old plaintext column is gone (hard cutover).
+    let has_api_key_col = sqlx::query("SELECT api_key FROM provider_key LIMIT 1")
+        .fetch_all(&pool)
+        .await
+        .is_ok();
+    assert!(
+        !has_api_key_col,
+        "api_key plaintext column must have been dropped"
+    );
+
+    // Round-trip: decrypt via list_provider_keys.
+    let keys = repo::list_provider_keys(&pool, &kp)
+        .await
+        .expect("list + decrypt");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].api_key, plaintext);
+
+    // A different master key fails to decrypt (tag failure → sqlx error).
+    let wrong_kp = StaticKeyProvider::new([2u8; 32], 1);
+    assert!(
+        repo::list_provider_keys(&pool, &wrong_kp).await.is_err(),
+        "wrong master key must fail to decrypt"
+    );
 }

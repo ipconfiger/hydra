@@ -173,6 +173,9 @@ mod tests {
             weight: 1,
             created_at: "t".into(),
             updated_at: "t".into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
         };
         let body = Bytes::from_static(b"{\"model\":\"gpt-4\"}");
         // We can't easily inspect a RequestBuilder's headers/url without
@@ -219,6 +222,9 @@ mod tests {
             weight: 1,
             created_at: "t".into(),
             updated_at: "t".into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
         };
         let body = Bytes::from_static(b"{}");
         let rb = pc.build_request(

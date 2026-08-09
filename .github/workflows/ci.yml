@@ -8,6 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  SQLX_OFFLINE: "true"
 
 jobs:
   check:
@@ -19,6 +20,11 @@ jobs:
         run: rustup show
 
       - uses: Swatinem/rust-cache@v2
+
+      # Cargo.lock is committed; fail fast if a Cargo.toml change left it out of
+      # sync. `--locked --dry-run` exits non-zero when the lockfile would change.
+      - name: Verify Cargo.lock is up to date
+        run: cargo update --workspace --locked --dry-run
 
       - name: Format check
         run: cargo fmt --check
@@ -49,8 +55,8 @@ jobs:
           fi
           echo "OK: hydra-core has no I/O dependencies."
 
-      # The full server suite runs only with the `server` feature (W4+); gated
-      # here so the foundation stays green until the shell exists.
-      - name: Test hydra-server (shell, when implemented)
-        run: cargo test -p hydra-server
-        continue-on-error: true
+      # The full server suite runs with the `server` feature (W4+). It is a hard
+      # CI gate: the suite is green (138 tests across 17 binaries). If a test
+      # becomes genuinely flaky, quarantine + fix it rather than muting the gate.
+      - name: Test hydra-server (shell)
+        run: cargo test -p hydra-server --features server

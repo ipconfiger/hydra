@@ -23,6 +23,7 @@ use hydra_core::config::{validate, CertMeta, ConfigData, ModelProvider, Severity
 use hydra_core::model::LimitRole;
 use hydra_core::swrr::SwrrState;
 
+use crate::crypto::KeyProvider;
 use crate::db;
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,8 @@ pub enum StoreError {
     Sqlx(#[from] sqlx::Error),
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("crypto: {0}")]
+    Crypto(#[from] crate::crypto::CryptoError),
     /// One or more fatal validation issues were found; the snapshot was not
     /// published (the caller keeps the previous one).
     #[error("fatal config validation: {0}")]
@@ -52,7 +55,10 @@ pub enum StoreError {
 /// Returns `Ok(ConfigData)` when the snapshot is publishable (non-fatal issues
 /// are logged at `WARN`). Returns `Err(StoreError::FatalValidation)` when any
 /// fatal issue is found, so [`ConfigStore::reload_all`] keeps the old snapshot.
-pub async fn build_config(pool: &SqlitePool) -> Result<ConfigData, StoreError> {
+pub async fn build_config(
+    pool: &SqlitePool,
+    kp: &dyn KeyProvider,
+) -> Result<ConfigData, StoreError> {
     // providers
     let mut providers: HashMap<String, _> = HashMap::new();
     for p in db::list_providers(pool).await? {
@@ -75,9 +81,9 @@ pub async fn build_config(pool: &SqlitePool) -> Result<ConfigData, StoreError> {
             });
     }
 
-    // provider keys
+    // provider keys (decrypted at the DB boundary; plaintext lives in-memory only)
     let mut provider_keys: HashMap<String, Vec<String>> = HashMap::new();
-    for k in db::list_provider_keys(pool).await? {
+    for k in db::list_provider_keys(pool, kp).await? {
         provider_keys
             .entry(k.provider_id.clone())
             .or_default()
@@ -212,16 +218,21 @@ pub struct ConfigStore {
     inner: Arc<ArcSwap<ConfigData>>,
     pool: SqlitePool,
     swrr: Arc<DashMap<(String, String), SwrrState>>,
+    key_provider: Arc<dyn KeyProvider>,
 }
 
 impl ConfigStore {
     /// Build the initial snapshot from the DB and wrap it in `ArcSwap`.
-    pub async fn load(pool: SqlitePool) -> Result<Self, StoreError> {
-        let cfg = build_config(&pool).await?;
+    pub async fn load(
+        pool: SqlitePool,
+        key_provider: Arc<dyn KeyProvider>,
+    ) -> Result<Self, StoreError> {
+        let cfg = build_config(&pool, key_provider.as_ref()).await?;
         Ok(Self {
             inner: Arc::new(ArcSwap::from_pointee(cfg)),
             pool,
             swrr: Arc::new(DashMap::new()),
+            key_provider,
         })
     }
 
@@ -245,7 +256,7 @@ impl ConfigStore {
     /// and the SWRR map is cleared so per-`(tenant, model)` weights are
     /// rebuilt lazily on the next request.
     pub async fn reload_all(&self) -> Result<(), StoreError> {
-        let new_cfg = build_config(&self.pool).await?;
+        let new_cfg = build_config(&self.pool, self.key_provider.as_ref()).await?;
         // Fatal validation surfaced as Err above → we never reach the store,
         // so the previous snapshot is preserved.
         self.inner.store(Arc::new(new_cfg));

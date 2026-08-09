@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use hydra_core::breaker::BreakerConfig;
 use hydra_server::admin::{AdminService, AdminState};
+use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
 use hydra_server::store::ConfigStore;
@@ -30,7 +31,8 @@ fn ephemeral_port() -> u16 {
 
 async fn admin_state() -> Arc<AdminState> {
     let pool = common::setup_pool().await;
-    let store = ConfigStore::load(pool.clone())
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::load(pool.clone(), key_provider.clone())
         .await
         .expect("ConfigStore::load");
     let auth = Arc::new(
@@ -46,6 +48,7 @@ async fn admin_state() -> Arc<AdminState> {
         store,
         auth,
         breaker,
+        key_provider,
         Some(TOKEN.to_string()),
         None,
     ))

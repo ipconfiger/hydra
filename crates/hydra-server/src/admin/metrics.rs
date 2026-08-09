@@ -25,6 +25,12 @@
 //! | `hydra_route_errors_total` | counter | tenant, reason | proxy `request_filter` (route err) |
 //! | `hydra_ttft_seconds` | histogram | tenant, provider, model | proxy `logging` (time to first token) |
 //! | `hydra_cached_tokens_total` | counter | tenant, provider, model | proxy `logging` (prompt-cache hits) |
+//! | `hydra_permit_inflight` | gauge | provider | admission module (set on acquire/release) |
+//! | `hydra_permit_available` | gauge | provider | admission module (capacity − inflight) |
+//! | `hydra_queue_depth` | gauge | provider | admission module (current waiters) |
+//! | `hydra_queue_wait_seconds` | histogram | provider | admission module (permit-acquired) |
+//! | `hydra_queue_drops_total` | counter | provider, reason | admission module (denied acquire) |
+//! | `hydra_admission_decisions_total` | counter | provider, outcome | admission module |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
 //! a cheap no-op, so instrumentation can never break the hot path. The
@@ -64,6 +70,19 @@ struct Metrics {
     /// Prompt-cache hit token count (OpenAI cached_tokens / Anthropic
     /// cache_read_input_tokens).
     cached_tokens: IntCounterVec,
+    // ── Admission control (design-admission-queue §10) ───────────────────
+    /// In-flight permits per provider (held = actively sending/streaming).
+    permit_inflight: IntGaugeVec,
+    /// Available (free) permits per provider.
+    permit_available: IntGaugeVec,
+    /// Current queued waiters per provider.
+    queue_depth: IntGaugeVec,
+    /// Queue wait time histogram (time spent waiting for a permit).
+    queue_wait: HistogramVec,
+    /// Queue drops (denied acquire) by reason.
+    queue_drops: IntCounterVec,
+    /// Admission decisions by outcome.
+    admission_decisions: IntCounterVec,
 }
 
 /// The SNI/Host mismatch counter name, registered by the W4b `tls` module. Kept
@@ -156,6 +175,44 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_cached_tokens_total",
                 "Prompt-cache hit tokens (cached_tokens / cache_read_input_tokens)",
                 &["tenant", "provider", "model"]
+            )
+            .ok()?,
+            // ── Admission control metrics (design-admission-queue §10) ─────
+            permit_inflight: register_int_gauge_vec!(
+                "hydra_permit_inflight",
+                "In-flight admission permits per provider (held = actively sending/streaming)",
+                &["provider"]
+            )
+            .ok()?,
+            permit_available: register_int_gauge_vec!(
+                "hydra_permit_available",
+                "Available (free) admission permits per provider",
+                &["provider"]
+            )
+            .ok()?,
+            queue_depth: register_int_gauge_vec!(
+                "hydra_queue_depth",
+                "Current queued waiters per provider (waiting for a permit)",
+                &["provider"]
+            )
+            .ok()?,
+            queue_wait: register_histogram_vec!(
+                "hydra_queue_wait_seconds",
+                "Time spent waiting in the admission queue before a permit was granted",
+                &["provider"],
+                LATENCY_BUCKETS.to_vec()
+            )
+            .ok()?,
+            queue_drops: register_int_counter_vec!(
+                "hydra_queue_drops_total",
+                "Admission denials (queue full / timeout / closed)",
+                &["provider", "reason"]
+            )
+            .ok()?,
+            admission_decisions: register_int_counter_vec!(
+                "hydra_admission_decisions_total",
+                "Admission decisions (acquired / queued / dropped)",
+                &["provider", "outcome"]
             )
             .ok()?,
         })
@@ -300,6 +357,60 @@ pub fn record_cached_tokens(tenant: &str, provider: &str, model: &str, n: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// Admission control metrics (design-admission-queue §10)
+// ---------------------------------------------------------------------------
+
+/// Set the in-flight permits gauge for a provider.
+#[allow(dead_code)]
+pub fn record_permit_inflight(provider: &str, n: i64) {
+    if let Some(m) = metrics() {
+        m.permit_inflight.with_label_values(&[provider]).set(n);
+    }
+}
+
+/// Set the available (free) permits gauge for a provider.
+#[allow(dead_code)]
+pub fn record_permit_available(provider: &str, n: i64) {
+    if let Some(m) = metrics() {
+        m.permit_available.with_label_values(&[provider]).set(n);
+    }
+}
+
+/// Set the queue-depth (current waiters) gauge for a provider.
+#[allow(dead_code)]
+pub fn record_queue_depth(provider: &str, n: i64) {
+    if let Some(m) = metrics() {
+        m.queue_depth.with_label_values(&[provider]).set(n);
+    }
+}
+
+/// Observe a queue wait duration in seconds (time spent waiting for a permit).
+#[allow(dead_code)]
+pub fn record_queue_wait(provider: &str, secs: f64) {
+    if let Some(m) = metrics() {
+        m.queue_wait.with_label_values(&[provider]).observe(secs);
+    }
+}
+
+/// Increment a queue drop (`reason` = "full" | "timeout" | "closed" | "client_gone").
+#[allow(dead_code)]
+pub fn record_queue_drop(provider: &str, reason: &str) {
+    if let Some(m) = metrics() {
+        m.queue_drops.with_label_values(&[provider, reason]).inc();
+    }
+}
+
+/// Increment an admission decision (`outcome` = "acquired" | "queued" | "dropped").
+#[allow(dead_code)]
+pub fn record_admission_decision(provider: &str, outcome: &str) {
+    if let Some(m) = metrics() {
+        m.admission_decisions
+            .with_label_values(&[provider, outcome])
+            .inc();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // /metrics rendering (default registry)
 // ---------------------------------------------------------------------------
 
@@ -352,6 +463,13 @@ mod tests {
         record_auth_upstream_error("t");
         record_ttft("t", "p", "m", 0.35);
         record_cached_tokens("t", "p", "m", 42);
+        // Admission metrics (design-admission-queue §10).
+        record_permit_inflight("p", 3);
+        record_permit_available("p", 5);
+        record_queue_depth("p", 2);
+        record_queue_wait("p", 0.012);
+        record_queue_drop("p", "timeout");
+        record_admission_decision("p", "acquired");
     }
 
     #[test]

@@ -44,7 +44,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use hydra_core::auth::{AuthVerdict, CacheSource};
-use hydra_core::config::ConfigData;
+use hydra_core::config::{resolve_policy, ConfigData};
 use hydra_core::extract::extract_model;
 use hydra_core::limit::MatchCtx;
 use hydra_core::model::{Candidate, RouteError};
@@ -60,6 +60,7 @@ use rand::seq::SliceRandom;
 use tracing::{debug, info, warn};
 
 use crate::http::{AuthChecker, HttpAuthChecker};
+use crate::proxy::admission::{AdmissionControl, AdmissionError};
 use crate::proxy::breaker_wrap::CircuitBreaker;
 use crate::proxy::config::ProxyConfig;
 use crate::proxy::ctx::RequestContext;
@@ -75,6 +76,8 @@ pub mod ctx;
 pub mod limiter;
 pub mod peer;
 pub mod provider_client;
+
+pub mod admission;
 
 /// The currently-selected upstream route, written in the failover loop when a
 /// candidate answers successfully and read by `logging`.
@@ -101,6 +104,11 @@ pub struct AppState {
     pub breaker: Arc<CircuitBreaker>,
     /// Concurrent rate limiter.
     pub limiter: Arc<RateLimiter>,
+    /// Per-provider bounded admission queue (design-admission-queue §3).
+    /// The concurrency valve: `acquire` before send, RAII permit released on
+    /// scope-exit. All-zero default policy ⇒ `Passthrough` (no-op for
+    /// unconfigured providers).
+    pub admission: AdmissionControl,
     /// Usage sink (fire-and-forget).
     pub sink: Arc<dyn UsageSink>,
     /// Proxy / failover / breaker policy.
@@ -416,25 +424,99 @@ impl ProxyHttp for HydraProxy {
         // unavoidable for any streaming gateway.
         let mut last_status: u16 = 502;
         let mut last_error: Option<String> = None;
+        // Track whether the LAST candidate failure was an admission (capacity)
+        // error vs a real upstream error. Design §6/§7: when ALL candidates
+        // fail with admission errors, the post-loop path emits 503 +
+        // Retry-After instead of the existing upstream-error behaviour.
+        let mut last_failure_was_admission = false;
+        // Minimum resolved queue_wait_timeout_ms across admission-failed
+        // candidates — used for the Retry-After hint (design §6).
+        let mut min_admission_wait_ms: Option<u64> = None;
         for cand in &candidates {
             let Some(provider) = cfg.providers.get(&cand.provider_id) else {
                 warn!(provider_id = %cand.provider_id, "candidate provider missing from config");
                 last_error = Some(format!("provider {} missing", cand.provider_id));
+                last_failure_was_admission = false;
                 continue;
             };
             let Some(endpoint) = parse_endpoint(&provider.endpoint) else {
                 warn!(provider_id = %cand.provider_id, "candidate endpoint unparseable");
                 last_error = Some(format!("provider {} bad endpoint", cand.provider_id));
+                last_failure_was_admission = false;
                 continue;
             };
             let Some(keys) = cfg.provider_keys.get(&cand.provider_id) else {
                 warn!(provider_id = %cand.provider_id, "candidate has no api keys");
                 last_error = Some(format!("provider {} no key", cand.provider_id));
+                last_failure_was_admission = false;
                 continue;
             };
             let Some(upstream_key) = keys.choose(&mut rand::thread_rng()) else {
+                last_failure_was_admission = false;
                 continue;
             };
+
+            // ── Admission control (design-admission-queue §6/§7) ──────────
+            //
+            // Acquire a concurrency permit BEFORE sending to the upstream.
+            // This is the concurrency valve — it bounds in-flight requests to
+            // `max_concurrency` per provider.
+            //
+            // ╔══════════════════════════════════════════════════════════════╗
+            // ║ §7 BREAKER BOUNDARY (inviolable): admission errors          ║
+            // ║ (QueueFull / WaitTimeout / Closed) are CAPACITY signals,    ║
+            // ║ NOT upstream errors. They MUST NOT call breaker.on_failure. ║
+            // ║ A busy provider is not a dead provider.                     ║
+            // ╚══════════════════════════════════════════════════════════════╝
+            //
+            // The permit (`_permit`) is held in this loop-body scope through
+            // build_request → send → stream_response, and drops on every
+            // `continue` / `return` / end-of-iteration — releasing the slot
+            // (RAII, risk #3).
+            //
+            // DEFAULT NO-OP: when the resolved policy has max_concurrency == 0
+            // (the all-zero default for unconfigured providers), acquire
+            // returns Permit::Passthrough instantly — no gate, no block, no
+            // semaphore. This is the safe-rollout invariant.
+            let policy = resolve_policy(
+                provider.max_concurrency,
+                provider.max_queue_depth,
+                provider.queue_wait_timeout_ms,
+                self.state.proxy.default_concurrency_policy,
+            );
+            let _permit = match self
+                .state
+                .admission
+                .acquire(&cand.provider_id, policy)
+                .await
+            {
+                Ok(p) => p,
+                // ── Capacity exhausted — §7: do NOT trip the breaker ──────
+                Err(AdmissionError::QueueFull)
+                | Err(AdmissionError::WaitTimeout)
+                | Err(AdmissionError::Closed) => {
+                    last_failure_was_admission = true;
+                    if policy.queue_wait_timeout_ms > 0 {
+                        min_admission_wait_ms = Some(
+                            min_admission_wait_ms.map_or(policy.queue_wait_timeout_ms, |m| {
+                                m.min(policy.queue_wait_timeout_ms)
+                            }),
+                        );
+                    }
+                    last_error = Some(format!(
+                        "provider {} admission denied (capacity)",
+                        cand.provider_id
+                    ));
+                    debug!(
+                        provider_id = %cand.provider_id,
+                        "admission denied; trying next candidate (NO breaker trip — §7)"
+                    );
+                    continue;
+                }
+            };
+            // Admission succeeded — reset the flag (this candidate reached the
+            // upstream send path; any subsequent failure is a real upstream error).
+            last_failure_was_admission = false;
 
             // Build + send (Oracle correction #10: start the TTFT timer before send).
             let req = self.provider_client.build_request(
@@ -531,6 +613,38 @@ impl ProxyHttp for HydraProxy {
             } else if let Some(t) = ctx.tenant.as_ref() {
                 crate::admin::metrics::record_retry(&t.id, "", "terminate_loop");
             }
+        }
+
+        // ── Post-loop: all candidates exhausted ──────────────────────────
+        //
+        // Design §6: if the LAST candidate failure was an admission (capacity)
+        // error, respond 503 + `Retry-After` (a conservative hint that a retry
+        // might find capacity). Otherwise (real upstream error), keep the
+        // EXISTING behaviour (map last_status to a gateway response).
+        if last_failure_was_admission {
+            ctx.status_code = 503;
+            // Retry-After = min queue_wait_timeout_ms / 1000 (at least 1s).
+            let retry_after_secs = (min_admission_wait_ms.unwrap_or(2000) / 1000).max(1);
+            info!(
+                trace_id = %ctx.trace_id,
+                retry_after = retry_after_secs,
+                error = ?last_error,
+                "all candidates exhausted on admission (capacity); 503 + Retry-After"
+            );
+            let body = Bytes::from(
+                "{\"error\":{\"message\":\"admission_denied\",\
+                 \"type\":\"proxy_error\",\"detail\":\"all providers at concurrency capacity\"}}",
+            );
+            session.set_keepalive(None);
+            let mut resp_header = ResponseHeader::build(503, Some(2))?;
+            resp_header.insert_header("Content-Type", "application/json")?;
+            resp_header.insert_header("Retry-After", retry_after_secs.to_string())?;
+            resp_header.insert_header("X-Hydra-Trace-Id", &ctx.trace_id)?;
+            session
+                .write_response_header(Box::new(resp_header), false)
+                .await?;
+            session.write_response_body(Some(body), true).await?;
+            return Ok(true);
         }
 
         // All candidates exhausted (§4.1 final branch). Map the last status to
@@ -879,18 +993,13 @@ fn pingora_err<S: Into<String>>(msg: S) -> Box<PingoraError> {
     PingoraError::explain(InternalError, msg.into())
 }
 
-/// Current time as an ISO-8601-ish UTC string (the sink column is text; core
-/// has no chrono dependency, so the shell formats it here).
+/// Current time as an RFC 3339 UTC string (e.g. `2026-08-09T12:34:56Z`).
+///
+/// `chrono` is available under the `runtime` feature (which `proxy` implies);
+/// the sink column is text, so we format here rather than in the pure core
+/// (which has no chrono dependency). Second precision matches the sink schema.
 fn now_iso8601() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Date-only precision is sufficient for usage records; a full ISO-8601
-    // formatter would require chrono (not in this feature set). We emit a
-    // unix-seconds-prefixed string that sorts correctly.
-    format!("t{secs}")
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 #[allow(dead_code)]

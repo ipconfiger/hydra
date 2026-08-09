@@ -27,6 +27,7 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 use tracing::debug;
 
+use crate::crypto::KeyProvider;
 use crate::http::HttpAuthChecker;
 use crate::proxy::breaker_wrap::CircuitBreaker;
 use crate::store::ConfigStore;
@@ -48,6 +49,11 @@ pub struct AdminState {
     pub store: ConfigStore,
     pub auth: Arc<HttpAuthChecker>,
     pub breaker: Arc<CircuitBreaker>,
+    /// Master-key provider for sealing/opening provider upstream api-keys
+    /// (design §16.2). Every `db::insert/get/list_provider_key[s]` call threads
+    /// `key_provider.as_ref()` through the encrypt-on-write / decrypt-on-read
+    /// boundary.
+    pub key_provider: Arc<dyn KeyProvider>,
     /// Single admin bearer token (design §13.3). Read once at startup from
     /// `HYDRA_ADMIN_TOKEN` (in `main`); held here so there is no per-request env
     /// read (avoids races under parallel tests). `None` ⇒ fail-closed (deny all).
@@ -71,6 +77,7 @@ impl AdminState {
         store: ConfigStore,
         auth: Arc<HttpAuthChecker>,
         breaker: Arc<CircuitBreaker>,
+        key_provider: Arc<dyn KeyProvider>,
         admin_token: Option<String>,
         cert_reloader: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
@@ -79,6 +86,7 @@ impl AdminState {
             store,
             auth,
             breaker,
+            key_provider,
             admin_token,
             reload_lock: Mutex::new(()),
             cert_reloader,

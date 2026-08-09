@@ -85,5 +85,9 @@ python3 integration/test_crud.py
   `127.0.0.1:8081` default, which is localhost-only and unreachable from the
   host) and `HYDRA_DB_URL=sqlite:/app/data/hydra.db?mode=rwc` (note: `main.rs`
   reads `HYDRA_DB_URL`, **not** the `HYDRA_DATABASE_URL` the Dockerfile sets).
+- `run.sh` generates a fresh `HYDRA_ENCRYPTION_KEY` (base64 32 bytes) per run and
+  passes it to the container. The binary fail-closes without it (provider
+  api-keys are AES-256-GCM encrypted at rest); a throwaway per-run key is correct
+  here because the DB and its keys are torn down on exit.
 - `run.sh` tears down both the container and its named volume on exit, so each
   run starts from a clean DB — no cross-run state leakage.

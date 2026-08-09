@@ -23,6 +23,7 @@ use hydra_core::model::{
     UsageRecord,
 };
 use hydra_server::admin::{AdminService, AdminState};
+use hydra_server::crypto::{KeyProvider, StaticKeyProvider};
 use hydra_server::db as repo;
 use hydra_server::http::{AuthCache, AuthConfig, HttpAuthChecker};
 use hydra_server::proxy::breaker_wrap::CircuitBreaker;
@@ -65,6 +66,9 @@ async fn seed(pool: &sqlx::SqlitePool, auth_url: &str, upstream: &str) {
             weight: 1,
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
+            max_concurrency: None,
+            max_queue_depth: None,
+            queue_wait_timeout_ms: None,
         },
     )
     .await
@@ -119,6 +123,7 @@ async fn seed(pool: &sqlx::SqlitePool, auth_url: &str, upstream: &str) {
     .unwrap();
     repo::insert_provider_key(
         pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
         &ProviderKey {
             id: "pk1".into(),
             provider_id: "p1".into(),
@@ -177,7 +182,8 @@ async fn metrics_endpoint_exposes_proxy_counters() {
     )
     .await;
 
-    let store = ConfigStore::load(pool.clone())
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::load(pool.clone(), key_provider.clone())
         .await
         .expect("ConfigStore::load");
 
@@ -197,6 +203,7 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         auth: auth.clone(),
         breaker: breaker.clone(),
         limiter,
+        admission: hydra_server::proxy::admission::AdmissionControl::new(),
         sink,
         proxy: ProxyConfig::default(),
     });
@@ -206,6 +213,7 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         store,
         auth,
         breaker,
+        key_provider,
         Some(TOKEN.to_string()),
         None,
     ));
