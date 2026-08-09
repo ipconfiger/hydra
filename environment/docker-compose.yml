@@ -1,0 +1,59 @@
+# Hydra full-stack: proxy + mock-tenant auth + ClickHouse usage sink.
+#
+# Prerequisites:
+#   1. Build the hydra image:  ./environment/build.sh
+#   2. Copy the config template:  cp environment/config.example.json secure/config.json
+#   3. Edit secure/config.json with your real provider api-keys + endpoints.
+#   4. Start:  cd environment && docker-compose up -d
+#   5. Init:   python3 environment/init.py
+#
+version: "3.8"
+
+services:
+  hydra:
+    image: hydra:latest
+    container_name: hydra
+    ports:
+      - "8080:8080"   # proxy (HTTP)
+      - "8081:8081"   # admin REST + UI + /metrics
+    environment:
+      HYDRA_ADMIN_TOKEN: ${HYDRA_ADMIN_TOKEN:-hydra-admin}
+      HYDRA_DB_URL: "sqlite:/app/data/hydra.db?mode=rwc"
+      HYDRA_LISTEN: "0.0.0.0:8080"
+      HYDRA_ADMIN_ADDR: "0.0.0.0:8081"
+      HYDRA_USAGE_SINK: clickhouse
+      HYDRA_CLICKHOUSE_URL: "http://clickhouse:8123"
+      RUST_LOG: info
+    volumes:
+      - hydra-data:/app/data
+    depends_on:
+      - clickhouse
+      - mock-tenant
+    restart: unless-stopped
+
+  mock-tenant:
+    build:
+      context: ./mock_tenant
+      dockerfile: Dockerfile.tenant
+    container_name: mock-tenant
+    ports:
+      - "9091:9091"
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface (Hydra writes usage here)
+      - "9000:9000"   # native TCP (optional: clickhouse-client)
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    restart: unless-stopped
+
+volumes:
+  hydra-data:
+  clickhouse-data:

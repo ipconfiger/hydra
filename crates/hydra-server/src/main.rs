@@ -115,7 +115,8 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
     // (2d) Usage sink.
     let sink_kind =
         std::env::var("HYDRA_USAGE_SINK").unwrap_or_else(|_| DEFAULT_USAGE_SINK.to_string());
-    let sink = build_sink(&sink_kind, Some(pool.clone()), None)?;
+    let ch_url = std::env::var("HYDRA_CLICKHOUSE_URL").ok();
+    let sink = build_sink(&sink_kind, Some(pool.clone()), ch_url.as_deref())?;
     let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::from(sink);
     info!(kind = %sink_kind, "usage sink built");
 

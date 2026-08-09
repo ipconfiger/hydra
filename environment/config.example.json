@@ -1,0 +1,38 @@
+{
+  "_comment": "Copy this file to secure/config.json and fill in your real api-keys. secure/ is gitignored.",
+  "admin_url": "http://localhost:8081",
+  "admin_token": "hydra-admin",
+
+  "providers": [
+    {
+      "id": "openai",
+      "key": "openai",
+      "name": "OpenAI",
+      "endpoint": "https://api.openai.com",
+      "weight": 1,
+      "api_keys": [
+        "sk-REPLACE-WITH-YOUR-OPENAI-API-KEY"
+      ],
+      "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
+    },
+    {
+      "id": "anthropic",
+      "key": "anthropic",
+      "name": "Anthropic",
+      "endpoint": "https://api.anthropic.com",
+      "weight": 1,
+      "api_keys": [
+        "sk-ant-REPLACE-WITH-YOUR-ANTHROPIC-API-KEY"
+      ],
+      "models": ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022"]
+    }
+  ],
+
+  "tenant": {
+    "id": "default",
+    "name": "Default Tenant",
+    "domain": "localhost",
+    "auth_url": "http://mock-tenant:9091",
+    "enabled": true
+  }
+}
