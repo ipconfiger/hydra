@@ -1,9 +1,0 @@
-# Temporary override: skip ClickHouse (image pull is slow) + use sqlite sink.
-# Remove this file to restore the full stack with ClickHouse.
-services:
-  hydra:
-    environment:
-      HYDRA_USAGE_SINK: sqlite
-  clickhouse:
-    profiles:
-      - full

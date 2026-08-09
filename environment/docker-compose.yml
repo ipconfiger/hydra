@@ -48,6 +48,7 @@ services:
       - "9000:9000"   # native TCP (optional: clickhouse-client)
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ulimits:
       nofile:
         soft: 262144
