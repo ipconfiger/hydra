@@ -103,32 +103,67 @@ fn rewrite_port_rendering() {
 
 // --- mask_key ---------------------------------------------------------------
 
-/// T8.5 — short keys (≤ 8 chars) are fully masked; never panics, never OOB.
+/// Short keys (< 6 chars) are fully masked; never panics, never OOB.
 #[test]
 fn mask_key_short_input() {
-    // Boundary lengths around the threshold.
-    assert_eq!(mask_key(""), "****");
-    assert_eq!(mask_key("abc"), "****");
-    assert_eq!(mask_key("12345678"), "****"); // exactly 8 ⇒ fully masked
-                                              // The masked form must never echo any of the original input.
+    // L < 6: all stars (same length as input).
+    assert_eq!(mask_key(""), "");
+    assert_eq!(mask_key("abc"), "***");
+    assert_eq!(mask_key("12345"), "*****");
+    // The masked form must never echo any of the original input.
     let secret = "sh0rt";
     let masked = mask_key(secret);
     assert_ne!(masked, secret);
     assert!(!masked.contains(secret));
 }
 
-/// T8.6 — normal-length keys keep first-4 + ellipsis + last-4.
+/// Mid-length keys (6..14) use first2 + stars + last2.
 #[test]
-fn mask_key_normal() {
-    // Minimal length that keeps the middle hidden: 9 chars.
-    assert_eq!(mask_key("123456789"), "1234…6789");
-    // Realistic api-key shape.
-    assert_eq!(mask_key("sk-secretvalue-wxyz"), "sk-s…wxyz");
-    // First-4 / last-4 must come from the actual head/tail.
-    let key = "sk-abcdefghijkl";
+fn mask_key_mid_length() {
+    // 10-char key: first 2 + 6 stars + last 2.
+    let key = "abcdefghij";
     let masked = mask_key(key);
-    assert_eq!(masked, "sk-a…ijkl");
-    assert!(masked.starts_with("sk-a"));
-    assert!(masked.ends_with("ijkl"));
-    assert!(masked.contains('…'));
+    assert_eq!(masked, "ab******ij");
+    assert!(masked.starts_with("ab"));
+    assert!(masked.ends_with("ij"));
+    assert!(!masked.contains("cdefgh"));
+    // 6-char boundary: first 2 + 2 stars + last 2.
+    assert_eq!(mask_key("abcdef"), "ab**ef");
+    // 13-char: first 2 + 9 stars + last 2.
+    let k13 = "1234567890abc";
+    let m13 = mask_key(k13);
+    assert_eq!(m13, "12*********bc");
+}
+
+/// Long keys (>= 14) use first10 + stars + last4.
+#[test]
+fn mask_key_long() {
+    // 14-char boundary: first 10 + 0 stars + last 4 (no middle to hide).
+    let k14 = "1234567890abcd";
+    assert_eq!(mask_key(k14), "1234567890abcd");
+    // 15-char: first 10 + 1 star + last 4.
+    let k15 = "1234567890abcde";
+    assert_eq!(mask_key(k15), "1234567890*bcde");
+
+    // Realistic 50-char key: first 10 + 36 stars + last 4.
+    let key = "01234567890123456789012345678901234567890123456789";
+    let len = key.chars().count();
+    assert_eq!(len, 50);
+    let masked = mask_key(key);
+    let masked_chars: Vec<char> = masked.chars().collect();
+    assert_eq!(masked_chars.len(), 50); // same length
+    assert!(masked.starts_with("0123456789"));
+    assert!(masked.ends_with("6789"));
+    // The middle 36 chars are all stars.
+    for &c in &masked_chars[10..46] {
+        assert_eq!(c, '*');
+    }
+    // Plaintext never appears in the mask.
+    assert!(!masked.contains("234567890123456789"));
+}
+
+/// A 4-char key is fully masked (L < 6).
+#[test]
+fn mask_key_four_chars() {
+    assert_eq!(mask_key("1234"), "****");
 }

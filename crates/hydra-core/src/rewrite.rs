@@ -3,7 +3,8 @@
 //! Two pure functions over plain data (design §6.5 / §9.5):
 //! - [`rewrite_path`] locates the first `/v1` in the request path and rebuilds
 //!   an upstream URL against a parsed [`EndpointUrl`].
-//! - [`mask_key`] redacts an api-key to `first4…last4`.
+//! - [`mask_key`] redacts an api-key to `first10 + *** + last4` (never
+//!   plaintext — P1-5).
 //!
 //! Both are allocation-only on the returned `String`; no I/O, no global state.
 //! The [`EndpointUrl`] value type is the shared parsed-endpoint form consumed
@@ -66,32 +67,55 @@ pub fn rewrite_path(req_path: &str, endpoint: &EndpointUrl) -> String {
     out
 }
 
-/// Mask an api-key to its first 4 + last 4 characters (design §9.5).
+/// Mask an api-key so it is identifiable but never plaintext (design §9.5 /
+/// P1-5: the admin API NEVER returns plaintext provider keys).
 ///
-/// A key of more than 8 characters becomes `first4…last4` (using the
-/// ellipsis `…`). Keys of **8 characters or fewer** cannot safely expose a
-/// head/tail without revealing the whole value (or overlapping), so they are
-/// fully redacted to `****`. This branch also guarantees no out-of-bounds
-/// panic on short or empty input.
+/// Format (operates on `char` boundaries — safe for any valid `&str`):
 ///
-/// Operates on Unicode scalar values (not raw bytes) so any valid `&str` —
-/// including non-ASCII — is masked without crossing a char boundary.
+/// | key length `L` | mask |
+/// |----------------|------|
+/// | `L >= 14` | first 10 chars + `'*'` × `(L − 14)` + last 4 chars |
+/// | `6 <= L < 14` | first 2 chars + `'*'` × `(L − 4)` + last 2 chars |
+/// | `L < 6` | `'*'` × `L` (fully masked) |
+///
+/// The three tiers ensure the masked form never reveals enough to reconstruct
+/// the original: long keys expose a recognisable prefix + suffix (for
+/// identification) but hide the entire middle; short keys expose less to avoid
+/// revealing the whole value.
 pub fn mask_key(key: &str) -> String {
-    const MASKED: &str = "****";
-
     let chars: Vec<char> = key.chars().collect();
-    if chars.len() <= 8 {
-        return MASKED.to_string();
-    }
+    let len = chars.len();
 
-    let last_start = chars.len() - 4;
-    let mut out = String::with_capacity(4 + 1 + 4);
-    for &c in &chars[..4] {
-        out.push(c);
+    if len >= 14 {
+        // first 10 + stars(L-14) + last 4
+        let star_count = len - 14;
+        let mut out = String::with_capacity(len);
+        for &c in &chars[..10] {
+            out.push(c);
+        }
+        for _ in 0..star_count {
+            out.push('*');
+        }
+        for &c in &chars[len - 4..] {
+            out.push(c);
+        }
+        out
+    } else if len >= 6 {
+        // first 2 + stars(L-4) + last 2
+        let star_count = len - 4;
+        let mut out = String::with_capacity(len);
+        for &c in &chars[..2] {
+            out.push(c);
+        }
+        for _ in 0..star_count {
+            out.push('*');
+        }
+        for &c in &chars[len - 2..] {
+            out.push(c);
+        }
+        out
+    } else {
+        // L < 6: all stars
+        "*".repeat(len)
     }
-    out.push('…');
-    for &c in &chars[last_start..] {
-        out.push(c);
-    }
-    out
 }

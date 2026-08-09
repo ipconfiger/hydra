@@ -1318,7 +1318,7 @@ PRAGMA mmap_size = 134217728;
 
 - 数据库文件权限 `0600`，仅服务用户可读；
 - 生产建议整库加密（SQLCipher / 磁盘加密）；
-- Admin API 列表接口默认**掩码返回**，仅在显式 `?reveal=1` 且管理员复核时返回原文。
+- Admin API **永远掩码返回** provider key（`first10 + *** + last4`）；`?reveal=1` 接受但已为 no-op（P1-5：admin token 泄露不应暴露所有上游 key）。
 
 ### 16.3 内部边界面（外部依赖，允许 Mock）
 

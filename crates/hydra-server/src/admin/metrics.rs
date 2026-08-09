@@ -31,6 +31,7 @@
 //! | `hydra_queue_wait_seconds` | histogram | provider | admission module (permit-acquired) |
 //! | `hydra_queue_drops_total` | counter | provider, reason | admission module (denied acquire) |
 //! | `hydra_admission_decisions_total` | counter | provider, outcome | admission module |
+//! | `hydra_mid_stream_errors_total` | counter | provider | proxy `stream_response` (mid-stream write/read failure after 200 sent) |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
 //! a cheap no-op, so instrumentation can never break the hot path. The
@@ -83,6 +84,10 @@ struct Metrics {
     queue_drops: IntCounterVec,
     /// Admission decisions by outcome.
     admission_decisions: IntCounterVec,
+    // ── Mid-stream observability (P2-9) ─────────────────────────────────
+    /// Mid-stream errors: a chunk read/write failed AFTER the 200 + first
+    /// chunk was already sent to the client (failover impossible).
+    mid_stream_errors: IntCounterVec,
 }
 
 /// The SNI/Host mismatch counter name, registered by the W4b `tls` module. Kept
@@ -213,6 +218,13 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_admission_decisions_total",
                 "Admission decisions (acquired / queued / dropped)",
                 &["provider", "outcome"]
+            )
+            .ok()?,
+            // ── Mid-stream observability (P2-9) ───────────────────────────
+            mid_stream_errors: register_int_counter_vec!(
+                "hydra_mid_stream_errors_total",
+                "Mid-stream failures after 200 + first byte sent (no failover possible)",
+                &["provider"]
             )
             .ok()?,
         })
@@ -411,6 +423,21 @@ pub fn record_admission_decision(provider: &str, outcome: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Mid-stream observability (P2-9)
+// ---------------------------------------------------------------------------
+
+/// Increment `hydra_mid_stream_errors_total{provider}` — a streaming response
+/// failed AFTER the 200 + first chunk was already sent to the client (the
+/// point of no failover). Observability only; the existing close-connection
+/// behavior stays.
+#[allow(dead_code)]
+pub fn record_mid_stream_error(provider: &str) {
+    if let Some(m) = metrics() {
+        m.mid_stream_errors.with_label_values(&[provider]).inc();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // /metrics rendering (default registry)
 // ---------------------------------------------------------------------------
 
@@ -470,6 +497,8 @@ mod tests {
         record_queue_wait("p", 0.012);
         record_queue_drop("p", "timeout");
         record_admission_decision("p", "acquired");
+        // Mid-stream observability (P2-9).
+        record_mid_stream_error("p");
     }
 
     #[test]

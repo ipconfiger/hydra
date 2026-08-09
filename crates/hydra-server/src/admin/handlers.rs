@@ -348,7 +348,7 @@ pub(super) async fn provider_model_item(
 }
 
 // ===========================================================================
-// Provider keys (masked by default; ?reveal=1 returns plaintext, §16.2)
+// Provider keys (ALWAYS masked — P1-5: the admin API never returns plaintext)
 // ===========================================================================
 
 pub(super) async fn provider_key_collection(
@@ -358,25 +358,20 @@ pub(super) async fn provider_key_collection(
     query: Option<&str>,
     trace_id: &str,
 ) -> Resp {
-    let reveal = query.is_some_and(|q| q.split('&').any(|kv| kv == "reveal=1"));
+    // `?reveal=1` is accepted for backward-compat but is now a no-op: the
+    // admin API NEVER returns plaintext provider keys (P1-5). An admin-token
+    // leak must not pull every upstream key.
+    let _reveal = query.is_some_and(|q| q.split('&').any(|kv| kv == "reveal=1"));
     if method == "GET" {
         match crate::db::list_provider_keys(&state.pool, state.key_provider.as_ref()).await {
             Ok(rows) => {
-                let out: Vec<ProviderKey> = if reveal {
-                    tracing::info!(
-                        target: "hydra::admin",
-                        trace_id,
-                        "admin reveal=1 access to provider keys (audit)"
-                    );
-                    rows
-                } else {
-                    rows.into_iter()
-                        .map(|mut k| {
-                            k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
-                            k
-                        })
-                        .collect()
-                };
+                let out: Vec<ProviderKey> = rows
+                    .into_iter()
+                    .map(|mut k| {
+                        k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
+                        k
+                    })
+                    .collect();
                 ok_json(200, &out)
             }
             Err(e) => db_err_resp(e, trace_id),
@@ -398,11 +393,8 @@ pub(super) async fn provider_key_collection(
             Err(e) => return db_err_resp(e, trace_id),
         }
         reload_best_effort(state, trace_id).await;
-        // Return the masked form on create by default (never echo plaintext
-        // back unless explicitly revealed).
-        if !reveal {
-            k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
-        }
+        // Never echo plaintext back (P1-5).
+        k.api_key = hydra_core::rewrite::mask_key(&k.api_key);
         ok_json(201, &k)
     } else {
         method_not_allowed(trace_id)

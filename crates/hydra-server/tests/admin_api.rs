@@ -373,7 +373,7 @@ async fn provider_model_crud_http() {
 }
 
 // ===========================================================================
-// §2.3 — provider-key masking + reveal
+// §2.3 — provider-key masking (P1-5: NEVER returns plaintext)
 // ===========================================================================
 
 #[tokio::test]
@@ -390,6 +390,7 @@ async fn provider_key_crud_http() {
     )
     .await;
 
+    let plaintext = "sk-supersecret-12345";
     let k = r#"{"id":"k1","provider_id":"p1","api_key":"sk-supersecret-12345","created_at":""}"#;
     let r = req(
         port,
@@ -401,11 +402,19 @@ async fn provider_key_crud_http() {
     .await;
     assert_eq!(r.status(), 201);
     let created: serde_json::Value = r.json().await.expect("json");
-    // Create returns masked form by default: first4…last4 (design §16.2).
-    assert_ne!(created["api_key"].as_str().unwrap(), "sk-supersecret-12345");
-    assert!(created["api_key"].as_str().unwrap().contains('…'));
+    // Create ALWAYS returns masked form (P1-5: never plaintext).
+    let created_key = created["api_key"].as_str().unwrap();
+    assert_ne!(created_key, plaintext);
+    assert!(
+        created_key.contains('*'),
+        "masked key should contain stars, got: {created_key}"
+    );
+    assert!(
+        !created_key.contains(plaintext),
+        "masked key must not contain plaintext"
+    );
 
-    // List masked by default.
+    // List — always masked, even without ?reveal.
     let r = req(
         port,
         reqwest::Method::GET,
@@ -417,9 +426,18 @@ async fn provider_key_crud_http() {
     let list: serde_json::Value = r.json().await.expect("json");
     let v = list.as_array().unwrap();
     assert_eq!(v.len(), 1);
-    assert_ne!(v[0]["api_key"].as_str().unwrap(), "sk-supersecret-12345");
+    let listed = v[0]["api_key"].as_str().unwrap();
+    assert_ne!(listed, plaintext);
+    assert!(
+        listed.contains('*'),
+        "masked key should contain stars, got: {listed}"
+    );
+    assert!(
+        !listed.contains(plaintext),
+        "masked key must not contain plaintext"
+    );
 
-    // ?reveal=1 returns plaintext (admin-gated).
+    // ?reveal=1 is accepted (200) but is now a NO-OP — still masked (P1-5).
     let r = req(
         port,
         reqwest::Method::GET,
@@ -428,10 +446,39 @@ async fn provider_key_crud_http() {
         None,
     )
     .await;
+    assert_eq!(r.status(), 200);
     let list: serde_json::Value = r.json().await.expect("json");
-    assert_eq!(
-        list.as_array().unwrap()[0]["api_key"].as_str().unwrap(),
-        "sk-supersecret-12345"
+    let revealed = list.as_array().unwrap()[0]["api_key"].as_str().unwrap();
+    assert_ne!(revealed, plaintext, "?reveal=1 must NOT return plaintext (P1-5)");
+    assert!(
+        revealed.contains('*'),
+        "masked key should contain stars even with ?reveal=1, got: {revealed}"
+    );
+    assert!(
+        !revealed.contains(plaintext),
+        "masked key must not contain plaintext even with ?reveal=1"
+    );
+
+    // Single-item GET — always masked.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/provider-keys/k1",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let item: serde_json::Value = r.json().await.expect("json");
+    let item_key = item["api_key"].as_str().unwrap();
+    assert_ne!(item_key, plaintext);
+    assert!(
+        item_key.contains('*'),
+        "masked key should contain stars, got: {item_key}"
+    );
+    assert!(
+        !item_key.contains(plaintext),
+        "masked key must not contain plaintext"
     );
 }
 

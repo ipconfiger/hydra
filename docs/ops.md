@@ -109,8 +109,8 @@ chown hydra:hydra /opt/hydra/data/hydra.db
 ```
 
 For higher assurance use SQLCipher or full-disk encryption (design §16.2). The
-admin API masks keys on read by default; `?reveal=1` returns plaintext and is
-audit-logged (§16.2).
+admin API always returns masked provider keys; `?reveal=1` is accepted as a
+no-op for backward-compat but never reveals plaintext (§16.2).
 
 ---
 
@@ -423,12 +423,18 @@ Two body caps ~~interact with failover~~ （terminate-mode 下只剩硬上限）
   `hydra_tokens_total`, `hydra_auth_decisions_total`, `hydra_auth_cache_size`,
   `hydra_breaker_dead`, `hydra_breaker_state_transitions_total`,
   `hydra_limit_rejected_total`, `hydra_sni_host_mismatch_total`,
-  `hydra_route_errors_total`.
+  `hydra_route_errors_total`, `hydra_mid_stream_errors_total`.
 - **Tracing**: structured logs via `tracing` (`RUST_LOG`). Every request carries
   an `X-Hydra-Trace-Id` echoed to the client and logged end-to-end.
 - **Admin UI**: `http://<admin_addr>/admin/` — same-origin, in-memory token
   prompt. Useful for incident inspection (breaker dead-set, health, manual
   reload, key reveal with audit log).
+
+> **Mid-stream failures are not retried.** Streaming responses that fail AFTER
+> the `200` + first byte are sent cannot be retried (sent bytes cannot be
+> unsent); the connection is closed, the failure is counted in
+> `hydra_mid_stream_errors_total{provider}`, and it still feeds the circuit
+> breaker.
 
 ---
 
