@@ -38,14 +38,14 @@
 
 > 设计文档中出现的 `MockAuthChecker` 等字样，在实现阶段一律替换为：纯缓存判定逻辑直接测（无需 mock）+ `HttpAuthChecker` 用 wiremock 测。trait 仍保留用于「生产配置 vs 测试配置」的装配，但测试用真实 double。
 
-### 铁律 3：热路径零拷贝 / 零 JSON 反复编解码
+### 铁律 3：终止模式（Terminate-in-Pingora）
 
-- 请求/响应的**主体载荷**（prompt、token 流）**原样转发**，**禁止**对完整 body 做 `serde_json::from_slice`→改→再序列化。
-- 少量元数据（`"model"`、`"usage"`）一律用 **`memchr` SIMD 字节扫描**提取（零分配、早退），命中处仅反序列化该小切片。
-- 改写只动 header（`upstream_request_filter` 物理上碰不到 body）。
-- 首 chunk 正常转发：`request_filter` 中 `read_body_bytes` 前调用 `enable_retry_buffering()`（Pingora 默认行为，回放已消费首 chunk，W4 spike 验证）；故障转移重放用**自实现 `Vec<Bytes>` 累加器**（`Bytes::clone` = O(1) 引用计数自增，零 memcpy，不受 64KiB 限制，大 body 安全）。Pingora 的 64KiB `BODY_BUF_LIMIT` 仅影响其自身 retry，本系统不依赖。
-- 诚实边界：H1 路径每 chunk 1 次内核拷贝（Pingora core 限制，不改 core 无法消除）；H2 路径真正零拷贝。本"零拷贝"指**应用层零 JSON 往返 + 引用计数式搬运**，非内核 `splice`/`sendfile`。
-- 详见 `design.md` §6 零拷贝原则、§6.3、§6.6、§8.5、§9.4。
+- **不再做零拷贝 stream-through**（已废弃）：当前架构在 `request_filter` 内终止请求，读取完整请求体后用自有 HTTP client (reqwest) 调用供应商，SSE 响应经 Pingora session 流式回写，返回 `Ok(true)`。
+- 请求体**完整读取**（`read_request_body()` 循环到 EOS），model 提取适用于**任意位置/schema**（不再受首 chunk 限制）。body 字节**原样传给 reqwest**（不做 JSON encode/decode）。
+- 故障转移是**简单 for 循环**（`Bytes::clone` O(1) 重放）；不再依赖 Pingora 的 `enable_retry_buffering` / `set_retry` / `fail_to_connect` / `error_while_proxy`。
+- 少量元数据（`"model"`、`"usage"`）仍一律用 **`memchr` SIMD 字节扫描**提取（零分配、早退），命中处仅反序列化该小切片。
+- 诚实边界：放弃 kernel-level 零拷贝（body 经过 userspace buffer），但保留"零 JSON 往返"的核心语义（body 字节未被 serde 处理）。
+- 详见 [`docs/design-change-terminate-mode.md`](design-change-terminate-mode.md)（原 §6 零拷贝原则、§6.3、§6.6、§8.5、§9.4 描述的是已废弃的 stream-through 架构）。
 
 ---
 
@@ -102,7 +102,7 @@ hydra/
 | **W1** | 纯领域核心 | `hydra-core` | 路由/SWRR/熔断/解析/限流/认证判定/重写，全纯 + 穷尽单测 | — | P0(骨架)+P3(路由纯部)+P4(熔断纯部)+P5(解析纯部)+P6(限流纯部)+P2(缓存纯部) | 4d |
 | **W2** | 持久化与配置加载 | both | sqlx schema/migrate、仓储、`ConfigStore` 加载+校验+ArcSwap | W1 | P1 | 1.5d |
 | **W3** | 外部边界适配器 | `hydra-server` | `AuthChecker`(reqwest)、`UsageSink`(sqlite/clickhouse) trait+实现，wiremock 测 | W1,W2 | P2(回源)+P5(sink) | 2d |
-| **W4** | Pingora 代理外壳 | `hydra-server` | `ProxyHttp` 全生命周期、body 处理、故障转移、TLS 证书回调 | W1,W2,W3 | P3(代理部)+P4(故障转移)+P8(TLS)+大body | 3d |
+| **W4** | Pingora 代理外壳 | `hydra-server` | **初版 stream-through，后重写为 terminate-mode**（proxy.rs 855 行重写 + 新增 provider_client.rs 237 行）：`ProxyHttp` `request_filter` 终止模式全生命周期、自有 reqwest client 调供应商、SSE 流式回写、简单 for 循环故障转移、TLS 证书回调 | W1,W2,W3 | P3(代理部)+P4(故障转移)+P8(TLS)+大body | 3d |
 | **W5** | 管理服务与可观测性 | `hydra-server` | AdminService(REST)、自托管 metrics、热更新、认证失效/熔断复位 | W1–W4 | P7 | 2d |
 | **W6** | UI、TLS 与加固 | both | 内嵌 UI、多租户 TLS 端到端、Playwright E2E、压测、ops 文档 | W1–W5 | P9 | 2d |
 
@@ -169,7 +169,7 @@ hydra/
 - [ ] `cargo clippy -- -D warnings`、`cargo fmt --check` 通过；
 - [ ] 本波次 TDD 任务全绿；
 - [ ] 生产代码零 mock/零桩/零 `#[cfg(test)]` 分支（code review + grep 校验）；
-- [ ] 热路径零 JSON 反复编解码：body 原样转发，`"model"`/`"usage"` 用 `memchr` 提取，故障转移重放用 `Vec<Bytes>`（grep 校验：无 `serde_json::from_slice` 作用于完整 body）；注：`enable_retry_buffering()` 用于首 chunk 正常转发（Pingora 默认，W4 验证），不在禁用之列；
+- [ ] 热路径零 JSON 反复编解码：body 原样传给 reqwest（terminate-mode），`"model"`/`"usage"` 用 `memchr` 提取，故障转移重放用 `Bytes::clone`（O(1)）（grep 校验：无 `serde_json::from_slice` 作用于完整 body；生产代码无 `enable_retry_buffering`——已删除）；
 - [ ] 凡外部边界，测试用真实进程级 double，并在 PR 注明。
 
 每波次额外出口准则见各自详档。
@@ -180,7 +180,7 @@ hydra/
 
 | 风险 | 缓解 |
 | --- | --- |
-| Pingora 0.8.1 body 转发机制（`read_body_bytes` 消费首 chunk 后需 `enable_retry_buffering` 回放） | ✅ W4 spike 已验证：`enable_retry_buffering()`（Pingora 默认）回放首 chunk 正常转发 + `Vec<Bytes>` 故障转移重放 |
+| ~~Pingora 0.8.1 body 转发机制（`read_body_bytes` 消费首 chunk 后需 `enable_retry_buffering` 回放）~~ | ✅ **已废弃**：terminate-mode 在 `request_filter` 内读全 body（`read_request_body()` 循环）后用自有 reqwest client 调供应商，不再依赖 Pingora 的首 chunk 回放 / retry buffer / `Vec<Bytes>` 累加器。详见 `docs/design-change-terminate-mode.md`。 |
 | 纯/外壳切分导致类型在 crate 间频繁搬运 | core 拥有领域类型；外壳只做 `Into/From` 转换，约定边界转换集中在 `bridge` 模块 |
 | wiremock 与 Pingora 上游集成测试复杂 | 外壳集成测试用独立 mock upstream server（真实 HTTP），不通过 Pingora mock 内部路由 |
 | 覆盖率门槛卡进度 | 仅对 `hydra-core` 设硬门槛；外壳以集成测试覆盖关键路径 |

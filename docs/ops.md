@@ -337,10 +337,16 @@ authoritative "live" view, and `status` as a human override.
 
 ---
 
-## 7. ⚠️ `retry_after_connect` — duplicate-billing risk (design §8.3)
+## 7. ~~⚠️ `retry_after_connect`~~ — duplicate-billing risk (**已删除，见 terminate-mode**)
+
+> **此配置项已在 terminate-mode 重写中删除。** 以下内容保留作为历史参考。
+>
+> Terminate-mode（当前实现）的故障转移是一个**简单 `for candidate in candidates { try send; on fail continue; }` 循环**：全 body 已缓存（`Bytes`），重放零成本（`Bytes::clone` O(1)）。失败时 `breaker.on_failure` + `record_retry("terminate_loop")`，成功则 `breaker.on_success`。
+>
+> 不再有 `retry_after_connect` 配置、不再有 `upstream_bytes_seen` / `body_too_large` 守卫、不再有 Pingora 的 `set_retry` / `fail_to_connect` / `error_while_proxy` 钩子。详见 `docs/design-change-terminate-mode.md` §4.3。
 
 > **READ THIS BEFORE ENABLING.** This is the single most dangerous knob in
-> Hydra.
+> Hydra. ~~（已删除）~~
 
 ```toml
 [failover]
@@ -386,22 +392,20 @@ Hydra to know whether the upstream billed during that silent window.
 
 ---
 
-## 8. `[proxy] max_request_body` vs failover (design §8.5)
+## 8. `[proxy] max_request_body` vs failover (**已更新为 terminate-mode**)
 
-Two body caps interact with failover:
+> Terminate-mode 读取**全请求体**（不再有 stream-through 的"软上限禁用重放"机制）。当前仅保留 **`max_request_body_hard`**（硬上限）作为防护；`max_request_body`（软上限）/ `body_too_large` / `error_while_proxy` 的 `body_replayable` 守卫**均已删除**。未来如需限制全 body 缓冲内存，可加 `max_body` → 415（未来增强）。
+
+Two body caps ~~interact with failover~~ （terminate-mode 下只剩硬上限）:
 
 | Cap | Default | Effect when exceeded |
 |-----|---------|----------------------|
-| `max_request_body` (soft) | 8 MiB | **Stops accumulating** the replay buffer. The body still **forwards untouched** (zero-copy), but `error_while_proxy` retry is **disabled** for that request (`body_replayable = false`, §8.3). First-attempt failure → terminal. |
-| `max_request_body_hard` | 32 MiB | **413 Payload Too Large** immediately, connection closed (`set_keepalive(None)`, §6.7). |
+| ~~`max_request_body` (soft)~~ | ~~8 MiB~~ | **已删除（terminate-mode 不使用）**：terminate-mode 读全 body，故障转移用 `Bytes::clone` O(1) 重放，无"软上限禁用重放"机制。 |
+| `max_request_body_hard` | 32 MiB | **413 Payload Too Large** immediately, connection closed (`set_keepalive(None)`, §6.7). 在 `request_filter` 全 body 读取循环中检测。 |
 
-**Trade-off**: a larger soft cap means more requests can fail over safely (good
-for availability) at the cost of more memory per request (the `Vec<Bytes>`
-replay buffer). 8 MiB covers virtually all chat requests; raise it only if you
-serve large vision/file prompts and can afford the memory.
+**Trade-off**（terminate-mode）：~~更大的软上限意味着更多请求可以安全故障转移（有利于可用性）~~ **不再适用**——全 body 已缓存，所有候选都能 O(1) 重放。内存占用 = 并发请求数 × 平均 body 大小（500 并发 × 2MB avg ≈ 1GB）。如需降低内存峰值，调低 `max_request_body_hard`（超过即 413）。
 
-> H2 paths are truly zero-copy on the forward leg; H1 paths incur one kernel
-> copy per chunk (Pingora core limitation, design §8.5).
+> ~~H2 paths are truly zero-copy on the forward leg; H1 paths incur one kernel copy per chunk (Pingora core limitation, design §8.5).~~ **（已废弃）** Terminate-mode 放弃 kernel-level 零拷贝（body 经 userspace buffer 传给 reqwest），但保留"零 JSON 往返"（body 字节未被 serde 处理）。详见 `docs/design-change-terminate-mode.md` §5。
 
 ---
 

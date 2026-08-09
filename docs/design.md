@@ -85,10 +85,10 @@
 
 本文档已通过 Oracle 高精度 Gate Review。修订要点（详见各节）：
 
-- **P0**：`session.peek_body()` 在 Pingora 0.8.1 不存在（PR #907 关闭未合并）→ 用 `read_body_bytes().await` 读首 chunk + `memchr` 提取 model。**W4 spike 验证**：`request_filter` 中 `read_body_bytes` 前需 `enable_retry_buffering()`（Pingora 默认）以回放首 chunk 正常转发；故障转移重放用自实现 `Vec<Bytes>` 累加器（不依赖 Pingora 的 64KiB retry buffer，大 body 安全）。详见 §6.3、§8.5。
-- **P1**：SWRR 状态重置（§5.3、§7.2）；`TenantModel` 闸门接入路由（§7.1）；`pingora-prometheus` 改自托管（§1.1）；熔断器（§8.4）；故障转移计费竞态对齐 + `retry_after_connect` 配置（§8.1、§8.3）；Anthropic usage schema（§9.4）。
+- **P0**：~~`session.peek_body()` 在 Pingora 0.8.1 不存在（PR #907 关闭未合并）→ 用 `read_body_bytes().await` 读首 chunk + `memchr` 提取 model。**W4 spike 验证**：`request_filter` 中 `read_body_bytes` 前需 `enable_retry_buffering()`（Pingora 默认）以回放首 chunk 正常转发；故障转移重放用自实现 `Vec<Bytes>` 累加器（不依赖 Pingora 的 64KiB retry buffer，大 body 安全）。详见 §6.3、§8.5。~~ **（已废弃，见 terminate-mode）**：当前 `request_filter` 读**全 body**（`read_request_body()` 循环到 EOS）后用 `memchr` 提取 model，不再依赖首 chunk / `enable_retry_buffering` / `Vec<Bytes>` 累加器。详见 `docs/design-change-terminate-mode.md` §4。
+- **P1**：SWRR 状态重置（§5.3、§7.2）；`TenantModel` 闸门接入路由（§7.1）；`pingora-prometheus` 改自托管（§1.1）；熔断器（§8.4）；~~故障转移计费竞态对齐 + `retry_after_connect` 配置（§8.1、§8.3）~~ **（§8.1/§8.3 已废弃：terminate-mode 用简单 for 循环，无 `retry_after_connect`）**；Anthropic usage schema（§9.4）。
 - **P2**：`weight=0` 语义（§7.2）、配置加载校验（§5.3）、`AuthVerdict` 携带状态码（§11.6）、证书单一数据源（§5.2、§12.1）、metrics 目录（§17）、非 JSON 路径（§6.3）、`/v1` 重写边界（§6.5）、短路面 body 处理（§6.3）。
-- **零拷贝修订（用户强制需求）**：禁止在热路径对主体载荷做 JSON 反复 encode/decode。请求/响应 body 原样转发；`"model"` 提取与 `"usage"` 扫描用 `memchr` SIMD 字节扫描（零分配、零 JSON 解析）；首 chunk 正常转发经 `enable_retry_buffering()` 回放（Pingora 默认，W4 验证），故障转移重放用自实现 `Vec<Bytes>` 累加器（不受 64KiB 限制）。详见 §6 零拷贝原则、§6.3、§6.6、§8.5、§9.4。
+- **~~零拷贝修订（用户强制需求）~~ → 终止模式修订（已实施）**：禁止在热路径对主体载荷做 JSON 反复 encode/decode（**仍成立**）。~~请求/响应 body 原样转发~~（已更新为 terminate-mode：body 原样传给 reqwest，响应 chunk 原样写回 session）；`"model"` 提取与 `"usage"` 扫描用 `memchr` SIMD 字节扫描（零分配、零 JSON 解析，**仍成立**）；~~首 chunk 正常转发经 `enable_retry_buffering()` 回放~~ **（已删除）**；~~故障转移重放用自实现 `Vec<Bytes>` 累加器~~ **（已删除：terminate-mode 读全 body，`Bytes::clone` O(1) 重放）**。详见 `docs/design-change-terminate-mode.md` §4/§5（原 §6 零拷贝原则、§6.3、§6.6、§8.5、§9.4 描述的是已废弃的 stream-through 架构）。
 
 ---
 
@@ -469,9 +469,16 @@ impl ConfigStore {
 
 ## 6. 代理请求生命周期
 
-> **⚠️ 架构变更（待 Oracle 审核）**：正在评估从"零拷贝 stream-through"切换到**"终止模式（Terminate-in-Pingora）"**——在 `request_filter` 内终止请求（读全 body → 用自有 HTTP client 调供应商 → 流式回写），根治 late-model 客户端的 model 提取问题。详见 [`docs/design-change-terminate-mode.md`](design-change-terminate-mode.md)。以下"零拷贝原则"描述的是**当前实现**；变更通过后将更新为本节描述的终止模式。
+> **✅ 架构变更（已实施）**：已从"零拷贝 stream-through"切换到**"终止模式（Terminate-in-Pingora）"**（已实施 + Oracle 审核 + e2e 验证通过）——在 `request_filter` 内终止请求（读全 body → 用自有 HTTP client 调供应商 → 流式回写），根治 late-model 客户端的 model 提取问题。详见 [`docs/design-change-terminate-mode.md`](design-change-terminate-mode.md) §4 的完整生命周期描述。
+>
+> **以下 §6.1–6.7 描述的是已废弃的 stream-through 架构（W4 初版）。** 当前实现已切换到 terminate-mode（在 `request_filter` 内终止请求，读全 body → 路由 → 用 reqwest 调供应商 → 流式回写 → `Ok(true)`）。以下内容保留作为历史参考，不再反映当前代码。终止模式的关键差异：
+> - model 提取从"首 chunk memchr 赌博"变为"全 body memchr"（任意位置/schema）；
+> - 故障转移从"`set_retry` / `fail_to_connect` / `error_while_proxy`"变为"简单 `for` 循环"（全 body 已缓存，`Bytes::clone` O(1) 重放）；
+> - 删除全部逆框架 hack（`enable_retry_buffering` / `Vec<Bytes>` 累加器 / `upstream_*_filter` / `response_*_filter` / `body_too_large`）。
+>
+> 仍成立的"零拷贝"语义：body 字节**原样传给 reqwest**（不做 JSON encode/decode）；`"model"`/`"usage"` 仍用 `memchr` SIMD 扫描提取。
 
-#### 零拷贝与最小拷贝架构（Zero-Copy，当前实现）
+#### 零拷贝与最小拷贝架构（Zero-Copy，**已废弃** — 见上方 terminate-mode 说明）
 
 **目标**：请求/响应的**主体载荷**（prompt、token 流）从下游 socket 到上游 socket（及反向）全程**不做 JSON 反复 encode/decode**，仅在必要处对**少量元数据**做扫描式提取，最大化 IO 吞吐。
 
@@ -491,6 +498,11 @@ impl ConfigStore {
 **`bytes::Bytes` 语义**：`Bytes::clone()`/`slice()` 为 O(1)（原子引用计数，无分配无拷贝）；body filter 中只读 `as_ref()` 即零拷贝借用，仅当 `*body = Some(new)` 替换时才触发旧分配释放。内核级 `splice`/`sendfile` 非本框架能力，本"零拷贝"指**应用层零 JSON 往返 + 引用计数式搬运**。
 
 ### 6.1 Pingora Hook 映射
+
+> **⚠️ 以下 §6.1-6.7 描述的是已废弃的 stream-through 架构（W4 初版）。
+> 当前实现已切换到 terminate-mode（在 `request_filter` 内终止请求，读全 body → 路由 → 用 reqwest 调供应商 → 流式回写 → `Ok(true)`）。
+> 详见 [`docs/design-change-terminate-mode.md`](design-change-terminate-mode.md) §4 的完整生命周期描述。
+> 以下内容保留作为历史参考，不再反映当前代码。**
 
 ```
 请求进入
@@ -726,6 +738,11 @@ pub fn resolve(
 ---
 
 ## 8. 故障转移与熔断
+
+> **⚠️ 以下故障转移机制（Pingora 的 `set_retry` / `fail_to_connect` / `error_while_proxy` / `upstream_bytes_seen`）已在 terminate-mode 重写中删除。
+> 当前故障转移是一个简单的 `for candidate in candidates { try send; on fail continue; }` 循环（全 body 已缓存，重放零成本 `Bytes::clone` O(1)）。每次失败 `breaker.on_failure` + `record_retry("terminate_loop")`，成功则 `breaker.on_success`。
+> 熔断器（§8.4）不变。详见 [`docs/design-change-terminate-mode.md`](design-change-terminate-mode.md) §4.3。
+> 以下 §8.1-8.3 保留作为历史参考，不再反映当前代码。**
 
 ### 8.1 触发点
 
@@ -1417,6 +1434,8 @@ PRAGMA mmap_size = 134217728;
 ## 19. 附录
 
 ### 19.1 关键 Pingora API 速查（已校验 0.8.1）
+
+> **注**：以下 API 表反映 stream-through 架构（已废弃）。Terminate-mode 仅使用 `request_filter`（返回 `Ok(true)`）+ `upstream_peer`（sentinel，返回 `HttpPeer::new("127.0.0.1:0", false, String::new())`）+ `logging`；请求构造与响应流式回写都在 `request_filter` 内完成（用自有 `ProviderClient`（reqwest）调供应商，`session.write_response_header`/`write_response_body` 流式回写）。详见 `docs/design-change-terminate-mode.md`。
 
 | 需求 | API | 备注 |
 | --- | --- | --- |

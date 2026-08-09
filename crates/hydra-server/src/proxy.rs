@@ -671,7 +671,12 @@ impl ProxyHttp for HydraProxy {
                 client_api_key_masked: masked,
                 status_code: status,
                 prompt_tokens: Some(usage.as_ref().and_then(|u| u.prompt_tokens).unwrap_or(0)),
-                completion_tokens: Some(usage.as_ref().and_then(|u| u.completion_tokens).unwrap_or(0)),
+                completion_tokens: Some(
+                    usage
+                        .as_ref()
+                        .and_then(|u| u.completion_tokens)
+                        .unwrap_or(0),
+                ),
                 total_tokens: Some(usage.as_ref().and_then(|u| u.total_tokens).unwrap_or(0)),
                 cached_tokens: Some(usage.as_ref().and_then(|u| u.cached_tokens).unwrap_or(0)),
                 latency_ms,
