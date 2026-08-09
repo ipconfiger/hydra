@@ -29,6 +29,7 @@ use tracing::debug;
 
 use crate::crypto::KeyProvider;
 use crate::http::HttpAuthChecker;
+use crate::proxy::admission::AdmissionControl;
 use crate::proxy::breaker_wrap::CircuitBreaker;
 use crate::store::ConfigStore;
 
@@ -66,12 +67,17 @@ pub struct AdminState {
     /// builds (no TLS listener) or when no cert store is wired. Held as a
     /// cfg-free closure so `AdminState` has a uniform shape across feature sets.
     pub cert_reloader: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Shared admission controller (design §3 / §13.2). Cloned from the same
+    /// `Arc<DashMap>` backing the proxy's `AppState.admission` — the
+    /// `GET /api/v1/concurrency` endpoint reads live gate state from here.
+    pub admission: AdmissionControl,
 }
 
 impl AdminState {
     /// Build admin state from the shared components. `cert_reloader` is invoked
     /// after every successful `reload_all` (and by `POST /api/v1/reload`).
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: SqlitePool,
         store: ConfigStore,
@@ -80,6 +86,7 @@ impl AdminState {
         key_provider: Arc<dyn KeyProvider>,
         admin_token: Option<String>,
         cert_reloader: Option<Arc<dyn Fn() + Send + Sync>>,
+        admission: AdmissionControl,
     ) -> Self {
         Self {
             pool,
@@ -90,6 +97,7 @@ impl AdminState {
             admin_token,
             reload_lock: Mutex::new(()),
             cert_reloader,
+            admission,
         }
     }
 }
@@ -172,6 +180,10 @@ impl AdminService {
         }
         if parts.len() == 2 && parts[0] == "breaker" && method == "DELETE" {
             return handlers::breaker_reset(&self.state, parts[1]);
+        }
+        // Concurrency admission snapshot (design §10 / §13.2).
+        if parts == ["concurrency"] && method == "GET" {
+            return handlers::concurrency_collection(&self.state);
         }
 
         // REST CRUD resources.

@@ -53,6 +53,7 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 use hydra_core::config::ConcurrencyPolicy;
+use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tokio::time::Duration;
@@ -178,6 +179,10 @@ struct ProviderGate {
     /// Current **waiters** (queued, not yet holding a permit). In-flight =
     /// `max_concurrency − semaphore.available_permits()`.
     queue_depth: Arc<AtomicUsize>,
+    /// The concurrency cap this gate was created with. Stored separately
+    /// because `tokio::sync::Semaphore` does not expose its total permit count
+    /// — we need it to compute `inflight = max_concurrency - available`.
+    max_concurrency: u32,
 }
 
 impl ProviderGate {
@@ -185,8 +190,28 @@ impl ProviderGate {
         Self {
             semaphore: Arc::new(Semaphore::new(policy.max_concurrency as usize)),
             queue_depth: Arc::new(AtomicUsize::new(0)),
+            max_concurrency: policy.max_concurrency,
         }
     }
+}
+
+/// Read-only view of one provider's admission state at a point in time.
+/// Returned by [`AdmissionControl::snapshot`] and serialized by the
+/// `GET /api/v1/concurrency` admin endpoint (design §10 / §13.2).
+#[derive(Debug, Serialize)]
+pub struct ProviderConcurrencyStatus {
+    /// Provider identifier (matches the `providers.id` column).
+    pub provider_id: String,
+    /// Configured concurrency cap (`max_concurrency`). `0` would mean
+    /// passthrough, but passthrough providers never create a gate — so every
+    /// entry in a snapshot has `max_concurrency > 0`.
+    pub max_concurrency: u32,
+    /// Requests currently holding a permit (= `max_concurrency - available`).
+    pub inflight: u32,
+    /// Free permits (= `semaphore.available_permits()`).
+    pub available: u32,
+    /// Requests currently **waiting** in the queue for a permit.
+    pub queue_depth: usize,
 }
 
 /// Top-level admission controller, keyed by `provider_id`. Cheap to clone
@@ -227,6 +252,33 @@ impl AdmissionControl {
             .get(provider_id)
             .map(|g| g.queue_depth.load(Ordering::Acquire))
             .unwrap_or(0)
+    }
+
+    /// Read-only snapshot of every live gate for the
+    /// `GET /api/v1/concurrency` admin endpoint (design §10 / §13.2). Returns
+    /// one [`ProviderConcurrencyStatus`] per gate. Providers with
+    /// `max_concurrency == 0` (passthrough) never create a gate and are omitted.
+    ///
+    /// The values are point-in-time and may change immediately after reading
+    /// (the semaphore and atomic are live). This is fine for observability —
+    /// the endpoint is for operators checking "is the queue backed up?".
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<ProviderConcurrencyStatus> {
+        self.gates
+            .iter()
+            .map(|entry| {
+                let gate = entry.value();
+                let available = gate.semaphore.available_permits() as u32;
+                let inflight = gate.max_concurrency.saturating_sub(available);
+                ProviderConcurrencyStatus {
+                    provider_id: entry.key().to_string(),
+                    max_concurrency: gate.max_concurrency,
+                    inflight,
+                    available,
+                    queue_depth: gate.queue_depth.load(Ordering::Acquire),
+                }
+            })
+            .collect()
     }
 
     /// Look up or lazily create the gate for `provider_id` under `policy`.

@@ -55,6 +55,7 @@ async fn admin_state() -> Arc<AdminState> {
         key_provider,
         Some(TOKEN.to_string()),
         None,
+        hydra_server::proxy::admission::AdmissionControl::new(),
     ))
 }
 
@@ -836,4 +837,125 @@ async fn health_returns_ok() {
     let v: serde_json::Value = r.json().await.expect("json");
     assert_eq!(v["status"], "ok");
     assert_eq!(v["db"], "ok");
+}
+
+// ===========================================================================
+// Concurrency admission snapshot (design §10 / §13.2)
+// ===========================================================================
+
+#[tokio::test]
+async fn concurrency_snapshot_reports_live_gates() {
+    use hydra_core::config::ConcurrencyPolicy;
+    use hydra_server::proxy::admission::AdmissionControl;
+
+    // Build a dedicated admin state with a shared admission controller so we
+    // can seed live gates before the server starts.
+    let pool = common::setup_pool().await;
+    let key_provider: Arc<dyn KeyProvider> = Arc::new(StaticKeyProvider::new([1u8; 32], 1));
+    let store = ConfigStore::load(pool.clone(), key_provider.clone())
+        .await
+        .expect("ConfigStore::load");
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .expect("HttpAuthChecker"),
+    );
+    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
+    let admission = AdmissionControl::new();
+
+    // Seed two gates: hold one permit on "p-capped" (max_concurrency=2) so
+    // inflight=1/available=1, and leave "p-idle" at 0 inflight.
+    let policy = ConcurrencyPolicy {
+        max_concurrency: 2,
+        max_queue_depth: 4,
+        queue_wait_timeout_ms: 1000,
+    };
+    let _held_permit = admission
+        .acquire("p-capped", policy)
+        .await
+        .expect("acquire p-capped");
+    let _idle_permit = admission
+        .acquire("p-idle", policy)
+        .await
+        .expect("acquire p-idle");
+    drop(_idle_permit); // p-idle back to inflight=0
+
+    let state = Arc::new(AdminState::new(
+        pool,
+        store,
+        auth,
+        breaker,
+        key_provider,
+        Some(TOKEN.to_string()),
+        None,
+        admission,
+    ));
+    let port = start_admin(state);
+
+    // Act.
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/concurrency",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.expect("json");
+
+    let providers = v["providers"].as_array().expect("providers array");
+    assert_eq!(providers.len(), 2, "two live gates");
+
+    let capped = providers
+        .iter()
+        .find(|e| e["provider_id"] == "p-capped")
+        .expect("p-capped entry");
+    assert_eq!(capped["max_concurrency"], 2);
+    assert_eq!(capped["inflight"], 1);
+    assert_eq!(capped["available"], 1);
+    assert_eq!(capped["queue_depth"], 0);
+
+    let idle = providers
+        .iter()
+        .find(|e| e["provider_id"] == "p-idle")
+        .expect("p-idle entry");
+    assert_eq!(idle["max_concurrency"], 2);
+    assert_eq!(idle["inflight"], 0);
+    assert_eq!(idle["available"], 2);
+    assert_eq!(idle["queue_depth"], 0);
+}
+
+#[tokio::test]
+async fn concurrency_snapshot_empty_when_no_gates() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/concurrency",
+        Some(TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.expect("json");
+    assert!(v["providers"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn concurrency_snapshot_requires_admin_token() {
+    let state = admin_state().await;
+    let port = start_admin(state);
+    let r = req(
+        port,
+        reqwest::Method::GET,
+        "/api/v1/concurrency",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(r.status(), 401);
 }

@@ -139,13 +139,14 @@ async fn bootstrap() -> Result<BootstrapComponents, Box<dyn std::error::Error>> 
         proxy_cfg.breaker.threshold,
     )));
     let limiter = Arc::new(RateLimiter::new());
+    let admission = hydra_server::proxy::admission::AdmissionControl::new();
 
     let state = Arc::new(AppState {
         store: store.clone(),
         auth: auth.clone(),
         breaker: breaker.clone(),
         limiter: limiter.clone(),
-        admission: hydra_server::proxy::admission::AdmissionControl::new(),
+        admission: admission.clone(),
         sink,
         proxy: proxy_cfg.clone(),
     });
@@ -198,6 +199,9 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
         Server::new(Some(Opt::default())).map_err(|e| format!("pingora server init: {e:?}"))?;
     server.bootstrap();
 
+    // Clone the admission controller out of AppState BEFORE c.state is moved
+    // into HydraProxy below, so AdminState::new can share the same DashMap.
+    let admission = c.state.admission.clone();
     let app = HydraProxy::new(c.state);
 
     let listen_addr = std::env::var("HYDRA_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
@@ -280,6 +284,7 @@ fn run_server(c: BootstrapComponents) -> Result<(), Box<dyn std::error::Error>> 
         c.key_provider.clone(),
         admin_token.clone(),
         cert_reloader,
+        admission.clone(),
     ));
     let admin_app = AdminService::new(admin_state);
     let mut admin_service =

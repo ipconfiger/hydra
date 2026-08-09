@@ -51,6 +51,7 @@ async fn admin_state() -> Arc<AdminState> {
         key_provider,
         Some(TOKEN.to_string()),
         None,
+        hydra_server::proxy::admission::AdmissionControl::new(),
     ))
 }
 

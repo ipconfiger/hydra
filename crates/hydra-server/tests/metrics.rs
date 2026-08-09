@@ -216,6 +216,7 @@ async fn metrics_endpoint_exposes_proxy_counters() {
         key_provider,
         Some(TOKEN.to_string()),
         None,
+        hydra_server::proxy::admission::AdmissionControl::new(),
     ));
 
     // --- start Pingora server with BOTH proxy + admin services ---------------

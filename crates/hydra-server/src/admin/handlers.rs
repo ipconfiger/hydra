@@ -844,6 +844,24 @@ pub(super) fn breaker_reset(state: &AdminState, id: &str) -> Resp {
 }
 
 // ===========================================================================
+// Concurrency admission snapshot (design §10 / §13.2)
+// ===========================================================================
+
+#[derive(Serialize)]
+struct ConcurrencyList {
+    providers: Vec<crate::proxy::admission::ProviderConcurrencyStatus>,
+}
+
+pub(super) fn concurrency_collection(state: &AdminState) -> Resp {
+    ok_json(
+        200,
+        &ConcurrencyList {
+            providers: state.admission.snapshot(),
+        },
+    )
+}
+
+// ===========================================================================
 // Health / reload (design §13.2)
 // ===========================================================================
 
