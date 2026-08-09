@@ -1,6 +1,6 @@
 # Hydra
 
-**A high-performance LLM routing gateway.** Route OpenAI-compatible client traffic to upstream model providers with per-tenant auth, weighted load balancing, failover, circuit breaking, rate limiting, usage metering, and per-tenant TLS — all on a zero-copy hot path. Built in Rust on [Pingora](https://github.com/cloudflare/pingora).
+**A high-performance LLM routing gateway.** Route OpenAI-compatible client traffic to upstream model providers with per-tenant auth, weighted load balancing, failover, circuit breaking, rate limiting, granular usage metering (input/cached/output tokens + TTFT), and per-tenant TLS. Built in Rust on [Pingora](https://github.com/cloudflare/pingora).
 
 [中文文档](README.zh-CN.md)
 
@@ -8,25 +8,25 @@
 
 ## What it is
 
-Hydra sits between your agents/clients and your LLM providers. A client request is resolved to a tenant by domain, authenticated against the tenant's own auth endpoint, routed (model × tenant-allowed providers, weighted round-robin), the client key is swapped for a provider key, the request is streamed through untouched, usage is parsed from the SSE response, and the result is recorded. If a provider fails, Hydra fails over to the next candidate automatically.
+Hydra sits between your agents/clients and your LLM providers. A client request is resolved to a tenant by domain, authenticated against the tenant's own auth endpoint, the **full request body is read** so `model` can be extracted from any position/schema, then Hydra routes (model × tenant-allowed providers, weighted round-robin), swaps the client key for a provider key, calls the real provider via its own HTTP client (reqwest), streams the response back, parses usage tokens (including cached tokens), and records it all.
 
 ```
-Agent ──► Hydra ──► [tenant resolve → external auth → route → swap key → forward]
-                                  │                        │
-                       tenant auth service          LLM / media provider
-                                  │                        │
-                                  └─► cached 5 min          └─► SSE streamed back, usage metered
+Agent ──► Pingora ──► [tenant resolve → external auth → read full body → extract model
+                        → route → swap key → reqwest call to provider → stream SSE back
+                        → parse usage (input/cached/output + TTFT) → record]
 ```
+
+If a provider fails, Hydra **failovers** to the next candidate automatically (trivial — the full body is already buffered, replay is O(1) refcount).
 
 ## Features
 
+- **Terminate-mode proxy**: reads the full request body in `request_filter` (model extraction works for ANY position/schema — no first-chunk peeking); calls the provider via a dedicated reqwest client; streams the SSE response back through Pingora's session writer. Returns `Ok(true)` so Pingora never dials upstream.
 - **Routing**: model name → providers ∩ tenant-allowed providers; smooth weighted round-robin (Nginx SWRR).
 - **External auth**: each tenant points to its own `auth_url`; Hydra caches verdicts 5 min and exposes an invalidation endpoint (the tenant decides欠费/封禁).
-- **Failover + circuit breaker**: connection failures auto-retry next provider; consecutive failures trip a dead-set with background probing.
+- **Failover + circuit breaker**: the failover loop tries each candidate provider in sequence; consecutive failures trip a dead-set with background probing. Full body replay is O(1) `Bytes::clone()`.
 - **Rate limiting**: in-memory sliding window (request count + token), per role, m/h/d windows.
-- **Usage recording**: pluggable sink (SQLite default, ClickHouse optional); token counts parsed from the SSE stream.
-- **Per-tenant TLS**: SNI-based certificate selection with hot-reload.
-- **Zero-copy**: request/response bodies flow through untouched; `model` and `usage` are extracted by `memchr` scan (no full-body JSON round-trip).
+- **Usage recording**: pluggable sink (SQLite default, ClickHouse optional); **granular token breakdown**: `prompt_tokens` / `completion_tokens` / `total_tokens` / `cached_tokens` (OpenAI `prompt_tokens_details` + Anthropic `cache_read_input_tokens`); **latency metrics**: `forward_latency_ms` (Hydra overhead before provider call) + `ttft_ms` (time to first token). All numeric fields default to 0 (no NULLs).
+- **Per-tenant TLS**: SNI-based certificate selection with hot-reload (BoringSSL/OpenSSL).
 - **Admin REST + UI**: full CRUD for all config entities, Prometheus `/metrics`, embedded dashboard.
 
 ## Deploy
@@ -37,22 +37,17 @@ Agent ──► Hydra ──► [tenant resolve → external auth → route → 
 # 1. cross-compile the linux/amd64 binary + build the image
 ./environment/build.sh
 
-# 2. run
-docker run -d --name hydra \
-  -p 443:443 -p 8080:8080 -p 8081:8081 \
-  -e HYDRA_ADMIN_TOKEN=<your-admin-token> \
-  -e HYDRA_ADMIN_ADDR=0.0.0.0:8081 \
-  -v "$PWD/data":/app/data \
-  hydra:latest
-```
+# 2. run the full stack (hydra + mock-tenant + clickhouse)
+cd environment && docker compose up -d
 
-> `build.sh` runs `rust_build_linux` (from `crates/hydra-server/`) → stages `bin/hydra` → `docker build`. The image is pinned `linux/amd64` to match the cross-compiled binary (runs under Rosetta/qemu on Apple Silicon).
+# 3. register your providers (reads secure/config.json)
+python3 ../environment/init.py
+```
 
 ### From source
 
 ```bash
 cargo build --release --features server
-# binary: target/release/hydra   (or ~/.cargo/global-target/release/hydra)
 HYDRA_ADMIN_TOKEN=<token> ./target/release/hydra
 ```
 
@@ -67,11 +62,10 @@ Hydra boots from **environment variables** (runtime) and stores all routing conf
 | `HYDRA_ADMIN_ADDR`   | `127.0.0.1:8081`                 | Admin REST + UI + `/metrics` listen address          |
 | `HYDRA_ADMIN_TOKEN`  | —                                | Bearer token gating `/api/v1/*` (**required for admin**) |
 | `HYDRA_USAGE_SINK`   | `sqlite`                         | `sqlite` or `clickhouse`                             |
+| `HYDRA_CLICKHOUSE_URL` | —                              | ClickHouse HTTP endpoint (when sink=clickhouse)      |
 | `RUST_LOG`           | `info`                           | Log level                                            |
 
 **Ports**: `8080`/`443` proxy · `8081` admin (REST + UI + metrics).
-
-**Config data model** (in SQLite, via `/api/v1/*`): `provider`, `provider-model`, `provider-key`, `tenant` (with `auth_url`), `tenant-provider`, `tenant-model`, `limit-role`. Full schema in `docs/design.md` §4.
 
 ## Use
 
@@ -105,28 +99,29 @@ curl http://localhost:8081/metrics
 Any OpenAI-compatible client: set the base URL to the proxy and send the tenant's client api-key.
 
 ```bash
-curl https://acme.example.com/v1/chat/completions \   # or http://<hydra>:8080/v1
+curl https://acme.example.com/v1/chat/completions \
   -H "Authorization: Bearer <client-api-key>" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-Hydra resolves tenant `acme` by domain → calls `auth_url` to authorize the key → routes `gpt-4o` to an allowed provider → swaps in a provider key → streams the response back → records usage.
+Hydra resolves tenant `acme` by domain → calls `auth_url` to authorize the key → routes `gpt-4o` to an allowed provider → swaps in a provider key → streams the response back → records usage (tokens + cached + TTFT).
 
 ## Project layout
 
 ```
 crates/hydra-core/    pure domain logic (router, SWRR, breaker, SSE scan, limits) — zero I/O deps
-crates/hydra-server/  Pingora proxy shell, DB, auth, usage sink, TLS, admin
-docs/                 design.md, dev-plan.md, ops.md, wave plans
-environment/          Dockerfile + build.sh (linux/amd64 runtime)
-integration/          Python CRUD test suite + docker runner
+crates/hydra-server/  Pingora proxy shell (terminate-mode), DB, auth, usage sink, TLS, admin
+environment/          Dockerfile + docker-compose + mock-tenant + init script
+integration/          Python CRUD test suite + e2e proxy test + mock LLM/auth
+docs/                 design.md, ops.md, dev-plan.md, architecture analysis
 ```
 
 ## More
 
 - Design & architecture: [`docs/design.md`](docs/design.md)
+- Architecture change (terminate-mode): [`docs/design-change-terminate-mode.md`](docs/design-change-terminate-mode.md)
 - Operations runbook: [`docs/ops.md`](docs/ops.md)
-- Development plan (TDD, no-mock, zero-copy): [`docs/dev-plan.md`](docs/dev-plan.md)
+- Interactive workflow diagram: [`docs/workflow.html`](docs/workflow.html)
 
-Rust 1.83+ · Pingora 0.8.x · License: see repository.
+Rust 1.83+ · Pingora 0.8.x
