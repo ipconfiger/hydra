@@ -12,6 +12,6 @@ CREATE TABLE IF NOT EXISTS usage_record (
     latency_ms         UInt32,
     upstream_host      Nullable(String),
     error              Nullable(String),
-    created_at         DateTime DEFAULT now()
+    created_at         String
 ) ENGINE = MergeTree()
 ORDER BY (created_at, tenant_id, provider_id);
