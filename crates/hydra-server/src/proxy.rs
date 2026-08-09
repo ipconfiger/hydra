@@ -198,8 +198,8 @@ impl ProxyHttp for HydraProxy {
     //   ③  external auth (cache-first) + metrics
     //   ④  read the FULL downstream body (loop → Bytes)
     //   ⑤  extract_model over the full body (memchr — any position/schema)
-    //   ⑥  router::resolve + swrr::order  (+ passthrough fallback)
-    //   ⑦  pre-limit count gate
+    //   ⑥  pre-limit count gate (BEFORE routing: 429 even if routing would 503)
+    //   ⑦  router::resolve + swrr::order  (+ passthrough fallback)
     //   ⑧  failover loop: build → send → stream-back, breaker on success/fail
     //   ⑨  return Ok(true)  ← Pingora never dials upstream itself
     //
@@ -324,7 +324,30 @@ impl ProxyHttp for HydraProxy {
             None
         };
 
-        // (7) Route (§6.3 §6 / §7): pure resolve + swrr.order, OR passthrough.
+        // (7) Pre-limit count gate (§6.3 §7 / §10.3). Runs BEFORE routing so a
+        //     rate-limited request gets 429 even when routing would otherwise
+        //     short-circuit (e.g. breaker-tripped → NoAvailableProvider → 503).
+        //     The model dimension is the extracted `model_opt` (identical to
+        //     what routing sets); provider is unknown until routing → `None`.
+        let masked = mask_key(&api_key);
+        let match_ctx = MatchCtx {
+            api_key: Some(&masked),
+            model: model_opt.as_deref(),
+            tenant: Some(&tenant_id),
+            provider: None,
+        };
+        let now = Instant::now();
+        if let CountVerdict::Denied { role_id } =
+            self.state
+                .limiter
+                .check_count(&cfg.limit_roles, &match_ctx, now)
+        {
+            debug!(role = %role_id, tenant = %tenant_id, "rate-limited (count)");
+            crate::admin::metrics::record_limit_rejected(&tenant_id, &role_id, "count");
+            return short_circuit(session, 429, "rate_limited").await;
+        }
+
+        // (8) Route (§6.3 §6 / §7): pure resolve + swrr.order, OR passthrough.
         let (candidates, model_for_route) = match model_opt {
             Some(m) => {
                 let model_key = m;
@@ -378,25 +401,6 @@ impl ProxyHttp for HydraProxy {
             swrr::order(&mut candidates, &mut guard);
         }
         ctx.candidates = candidates.clone();
-
-        // (8) Pre-limit count gate (§6.3 §7 / §10.3).
-        let masked = mask_key(&api_key);
-        let match_ctx = MatchCtx {
-            api_key: Some(&masked),
-            model: model_for_route.as_deref(),
-            tenant: Some(&tenant_id),
-            provider: None,
-        };
-        let now = Instant::now();
-        if let CountVerdict::Denied { role_id } =
-            self.state
-                .limiter
-                .check_count(&cfg.limit_roles, &match_ctx, now)
-        {
-            debug!(role = %role_id, tenant = %tenant_id, "rate-limited (count)");
-            crate::admin::metrics::record_limit_rejected(&tenant_id, &role_id, "count");
-            return short_circuit(session, 429, "rate_limited").await;
-        }
 
         // (9) Failover loop (terminate-mode §4.1 ⑦/⑧). Body is in hand as
         //     `Bytes`; each attempt is an O(1) clone. On a connect/HTTP error

@@ -697,6 +697,173 @@ async fn error_502_when_all_providers_fail() {
     assert_eq!(resp.status(), 503);
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Rate-limit enforcement (§10.3): the limit gate must run BEFORE routing so a
+// rate-limited request gets 429 even when routing would short-circuit with 503
+// (e.g. breaker-tripped → NoAvailableProvider).
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Send a single chat-completion request (after the proxy is confirmed ready).
+async fn send_one(client: &reqwest::Client, url: &str, body: &str) -> reqwest::Response {
+    client
+        .post(url)
+        .header("authorization", "Bearer test-client-key")
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("send")
+}
+
+/// Tighten the default limit role (id="default", seeded by `seed_one` with
+/// count=1000) to count=2 so the third request is denied.
+async fn tighten_limit_to_2(pool: &sqlx::SqlitePool) {
+    repo::update_limit_role(
+        pool,
+        &LimitRole {
+            id: "default".into(),
+            name: "default".into(),
+            matching_key: None,
+            matching_model: None,
+            matching_tenant: None, // match-all (design §10.1 wildcard)
+            matching_provider: None,
+            limit_count: Some(2),
+            limit_token: None,
+            window: "m".into(),
+            enabled: true,
+            created_at: NOW.into(),
+        },
+    )
+    .await
+    .expect("update limit role to count=2");
+}
+
+/// Basic limit enforcement: provider alive, count=2, the third request is 429.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rate_limit_429_on_third_request() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&auth_server)
+        .await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"id":"ok","object":"chat.completion","choices":[]}"#),
+        )
+        // Exactly two provider calls: req3 is 429'd before routing.
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    tighten_limit_to_2(&pool).await;
+
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+    let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
+
+    let r1 = send_until_ready(&client, &url, body).await;
+    assert_eq!(r1.status(), 200, "req1 should pass");
+    let _ = r1.text().await;
+
+    let r2 = send_one(&client, &url, body).await;
+    assert_eq!(r2.status(), 200, "req2 should pass");
+    let _ = r2.text().await;
+
+    let r3 = send_one(&client, &url, body).await;
+    assert_eq!(r3.status(), 429, "req3 must be rate-limited (429)");
+    let r3body = r3.text().await.expect("body");
+    assert!(r3body.contains("rate_limited"), "body: {r3body}");
+}
+
+/// **Regression test**: when the provider is dead (breaker tripped after 2
+/// failures) AND the limit is exceeded, the third request must get **429**
+/// (rate-limited), NOT 503 (no-available-provider). This proves the limit gate
+/// runs BEFORE routing — the root cause of the 503-instead-of-429 bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rate_limit_429_even_when_routing_would_503() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&auth_server)
+        .await;
+    let upstream = MockServer::start().await;
+    // Provider always returns 500 → breaker accumulates consecutive failures.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        // Exactly two provider calls (req1 + req2); req3 never reaches routing.
+        .expect(2)
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    seed_one(
+        &pool,
+        &format!("{}/auth", auth_server.uri()),
+        &upstream.uri(),
+    )
+    .await;
+    tighten_limit_to_2(&pool).await;
+
+    // Build state with breaker threshold=2: after two 500s the provider enters
+    // the dead-set, so routing on req3 would return NoAvailableProvider → 503
+    // (old code). With the fix the limit gate fires first → 429.
+    let store = ConfigStore::load(pool.clone()).await.unwrap();
+    let auth = Arc::new(
+        HttpAuthChecker::new(
+            AuthCache::new(Duration::from_secs(300), Duration::from_secs(30)),
+            AuthConfig::default(),
+        )
+        .unwrap(),
+    );
+    let breaker = Arc::new(CircuitBreaker::new(BreakerConfig::new(2)));
+    let limiter = Arc::new(RateLimiter::new());
+    let sink: Arc<dyn hydra_server::sink::UsageSink> = Arc::new(NoopSink);
+    let state = Arc::new(AppState {
+        store,
+        auth,
+        breaker,
+        limiter,
+        sink,
+        proxy: ProxyConfig::default(),
+    });
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+    let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
+
+    // req1: limit 0→1 admitted; provider 500 → breaker fail #1 (not dead yet).
+    let r1 = send_until_ready(&client, &url, body).await;
+    assert_ne!(r1.status(), 429, "req1 must not be rate-limited");
+    let _ = r1.text().await;
+
+    // req2: limit 1→2 admitted; provider 500 → breaker fail #2 → dead-set.
+    let r2 = send_one(&client, &url, body).await;
+    assert_ne!(r2.status(), 429, "req2 must not be rate-limited");
+    let _ = r2.text().await;
+
+    // req3: limit exhausted (count=2). OLD code: routing → provider dead → 503.
+    // NEW code: limit gate fires first → 429.
+    let r3 = send_one(&client, &url, body).await;
+    assert_eq!(
+        r3.status(),
+        429,
+        "req3 must be 429 (rate-limited), not 503 (no provider) — the limit gate must run before routing"
+    );
+}
+
 // ===========================================================================
 // RecordingSink helper (captures usage records for verification)
 // ===========================================================================
