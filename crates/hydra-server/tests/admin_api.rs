@@ -449,7 +449,10 @@ async fn provider_key_crud_http() {
     assert_eq!(r.status(), 200);
     let list: serde_json::Value = r.json().await.expect("json");
     let revealed = list.as_array().unwrap()[0]["api_key"].as_str().unwrap();
-    assert_ne!(revealed, plaintext, "?reveal=1 must NOT return plaintext (P1-5)");
+    assert_ne!(
+        revealed, plaintext,
+        "?reveal=1 must NOT return plaintext (P1-5)"
+    );
     assert!(
         revealed.contains('*'),
         "masked key should contain stars even with ?reveal=1, got: {revealed}"

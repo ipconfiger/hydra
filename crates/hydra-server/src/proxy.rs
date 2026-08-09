@@ -570,9 +570,7 @@ impl ProxyHttp for HydraProxy {
                             // already written: failover is impossible (client saw
                             // 200 + partial body). Log + close. Do NOT retry.
                             // P2-9: count it for observability.
-                            crate::admin::metrics::record_mid_stream_error(
-                                &cand.provider_id,
-                            );
+                            crate::admin::metrics::record_mid_stream_error(&cand.provider_id);
                             warn!(
                                 trace_id = %ctx.trace_id,
                                 provider_id = %cand.provider_id,
