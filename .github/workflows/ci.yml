@@ -29,11 +29,16 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+      # `--all-targets` compiles the integration tests (tests/*.rs), which
+      # reference sqlx / hydra_server::db and therefore require the `server`
+      # feature (db/proxy/http-client/runtime). Without it, default-features
+      # (empty) leaves sqlx unresolved and the step fails. Scope the feature to
+      # hydra-server via pkg/feat syntax; hydra-core clippies with its defaults.
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features hydra-server/server -- -D warnings
 
       - name: Build workspace
-        run: cargo build --all
+        run: cargo build --workspace --features hydra-server/server
 
       # T1.1 / T1.2 / T10.1 (mirror) / T10.2 — the pure-core suite, incl. the
       # in-process dependency-firewall test.
