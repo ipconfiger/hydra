@@ -8,245 +8,99 @@
   <link rel="stylesheet" href="/admin/style.css" />
   <link rel="icon" href="data:," />
 </head>
-<body>
+<body data-state="locked">
 
-  <!-- Login overlay: shown until the admin token is entered (design §13.3).
-       The token is held only in-memory in app.js and attached as
-       `Authorization: Bearer <token>` on every fetch. It is never persisted. -->
-  <div id="login-overlay">
-    <div class="card">
-      <h2>Hydra Admin</h2>
-      <p class="help">
+  <!-- ================= Login overlay =================
+       Shown until the admin token is entered (design §13.3). The token is held
+       only in-memory in app.js and attached as `Authorization: Bearer <token>`
+       on every fetch. It is never persisted. -->
+  <div id="login-overlay" class="overlay">
+    <div class="auth-card">
+      <div class="auth-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 7c3 0 4 5 7 5s4-5 7-5" opacity=".8"/>
+          <path d="M3 12c3 0 4 5 7 5s4-5 7-5"/>
+          <circle cx="20" cy="12" r="1.6" fill="#fff" stroke="none"/>
+        </svg>
+      </div>
+      <h1>Hydra <span class="grad">Admin</span></h1>
+      <p class="auth-help">
         Enter the admin token (<code>HYDRA_ADMIN_TOKEN</code>). It is kept in
         memory only and sent as <code>Authorization: Bearer</code>.
       </p>
-      <label class="field">
-        <span>Admin token</span>
-        <input type="password" id="login-token" autocomplete="off" autofocus />
-      </label>
-      <div class="right">
-        <button class="btn primary" id="login-btn">Sign in</button>
-      </div>
-      <div id="login-error" class="banner err hidden" style="margin-top:12px"></div>
+      <form id="login-form" class="auth-form" autocomplete="off">
+        <div class="input-group">
+          <label for="login-token">Admin token</label>
+          <div class="input-wrap">
+            <input type="password" id="login-token" autocomplete="off" autofocus
+                   placeholder="paste token…" />
+          </div>
+        </div>
+        <button class="btn primary block" id="login-btn" type="submit">Sign in</button>
+        <div id="login-error" class="alert err hidden"></div>
+      </form>
     </div>
   </div>
 
-  <header class="topbar">
-    <h1>Hydra</h1>
-    <span class="token-status" id="token-status">not authenticated</span>
-    <span class="spacer"></span>
-    <button class="btn small" id="reload-btn" title="POST /api/v1/reload">Reload config</button>
-    <button class="btn small danger" id="logout-btn">Sign out</button>
-  </header>
+  <!-- ================= App shell ================= -->
+  <div class="app" id="app" aria-hidden="true">
 
-  <nav class="tabs" id="tabs">
-    <button data-tab="providers" class="active">Providers</button>
-    <button data-tab="models">Models</button>
-    <button data-tab="keys">Keys</button>
-    <button data-tab="tenants">Tenants</button>
-    <button data-tab="tenant-access">TenantAccess</button>
-    <button data-tab="tenant-models">TenantModels</button>
-    <button data-tab="limit-roles">LimitRoles</button>
-    <button data-tab="auth-cache">AuthCache</button>
-    <button data-tab="breaker">Breaker</button>
-    <button data-tab="health">Health</button>
-  </nav>
-
-  <main>
-    <div id="toast" class="toast hidden"></div>
-
-    <!-- ===================== Providers ===================== -->
-    <section class="panel active" data-panel="providers">
-      <h2>
-        Providers
-        <span class="count" id="providers-count"></span>
-        <span class="actions"><button class="btn primary small" id="provider-new">+ New</button></span>
-      </h2>
-      <div id="provider-form" class="hidden" style="margin-bottom:14px"></div>
-      <div class="table-wrap">
-        <table id="providers-table">
-          <thead><tr>
-            <th>id</th><th>key</th><th>name</th><th>endpoint</th>
-            <th class="num">weight</th><th>created</th><th>updated</th><th></th>
-          </tr></thead>
-          <tbody></tbody>
-        </table>
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 7c3 0 4 5 7 5s4-5 7-5" opacity=".8"/>
+            <path d="M3 12c3 0 4 5 7 5s4-5 7-5"/>
+            <circle cx="20" cy="12" r="1.6" fill="#fff" stroke="none"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <span class="brand-name"><span class="grad">Hydra</span></span>
+          <span class="brand-sub">admin console</span>
+        </div>
       </div>
-    </section>
 
-    <!-- ===================== Models ===================== -->
-    <section class="panel" data-panel="models">
-      <h2>
-        Provider Models
-        <span class="count" id="models-count"></span>
-        <span class="actions"><button class="btn primary small" id="model-new">+ New</button></span>
-      </h2>
-      <div id="model-form" class="hidden" style="margin-bottom:14px"></div>
-      <div class="table-wrap">
-        <table id="models-table">
-          <thead><tr>
-            <th>id</th><th>key</th><th>name</th><th>provider_id</th>
-            <th>status</th><th></th>
-          </tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
+      <nav class="nav" id="nav" aria-label="sections"><!-- JS-rendered --></nav>
 
-    <!-- ===================== Keys ===================== -->
-    <section class="panel" data-panel="keys">
-      <h2>
-        Provider Keys
-        <span class="count" id="keys-count"></span>
-        <span class="actions">
-          <label class="pill" style="cursor:pointer">
-            <input type="checkbox" id="keys-reveal" style="vertical-align:middle" /> reveal plaintext (?reveal=1)
-          </label>
-          <button class="btn primary small" id="key-new">+ New</button>
-        </span>
-      </h2>
-      <p class="muted" style="font-size:12px;margin:0 0 8px">
-        Keys are masked by default (design §16.2). Revealing plaintext is
-        audit-logged on the server.
-      </p>
-      <div id="key-form" class="hidden" style="margin-bottom:14px"></div>
-      <div class="table-wrap">
-        <table id="keys-table">
-          <thead><tr>
-            <th>id</th><th>provider_id</th><th>api_key</th><th>created</th><th></th>
-          </tr></thead>
-          <tbody></tbody>
-        </table>
+      <div class="sidebar-foot">
+        <div class="token-status" id="token-status">
+          <span class="dot"></span><span class="t">not authenticated</span>
+        </div>
+        <div class="foot-actions">
+          <button class="btn ghost sm" id="reload-btn" title="POST /api/v1/reload">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v4h-4"/></svg>
+            Reload
+          </button>
+          <button class="btn ghost sm danger" id="logout-btn" title="clear token">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>
+            Sign out
+          </button>
+        </div>
       </div>
-    </section>
+    </aside>
 
-    <!-- ===================== Tenants ===================== -->
-    <section class="panel" data-panel="tenants">
-      <h2>
-        Tenants
-        <span class="count" id="tenants-count"></span>
-        <span class="actions"><button class="btn primary small" id="tenant-new">+ New</button></span>
-      </h2>
-      <div id="tenant-form" class="hidden" style="margin-bottom:14px"></div>
-      <div class="table-wrap">
-        <table id="tenants-table">
-          <thead><tr>
-            <th>id</th><th>name</th><th>domain</th><th>auth_url</th>
-            <th>cert</th><th>enabled</th><th>created</th><th>updated</th><th></th>
-          </tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
+    <div class="scrim" id="sidebar-scrim"></div>
 
-    <!-- ===================== TenantAccess ===================== -->
-    <section class="panel" data-panel="tenant-access">
-      <h2>
-        Tenant ↔ Provider Access
-        <span class="count" id="tenant-access-count"></span>
-        <span class="actions"><button class="btn primary small" id="tp-new">+ New</button></span>
-      </h2>
-      <div id="tp-form" class="hidden" style="margin-bottom:14px"></div>
-      <div class="table-wrap">
-        <table id="tenant-access-table">
-          <thead><tr><th>id</th><th>tenant_id</th><th>provider_id</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
+    <!-- Main column -->
+    <div class="main">
+      <header class="topbar">
+        <button class="icon-btn menu-toggle" id="menu-toggle" aria-label="toggle navigation">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+        </button>
+        <div class="topbar-title">
+          <h1 id="page-title">—</h1>
+          <p id="page-sub" class="muted"></p>
+        </div>
+        <div class="topbar-actions" id="page-actions"></div>
+      </header>
+      <main class="content" id="content"><!-- JS-rendered --></main>
+    </div>
+  </div>
 
-    <!-- ===================== TenantModels ===================== -->
-    <section class="panel" data-panel="tenant-models">
-      <h2>
-        Tenant Models (access gate, design §7.1)
-        <span class="count" id="tenant-models-count"></span>
-        <span class="actions"><button class="btn primary small" id="tm-new">+ New</button></span>
-      </h2>
-      <div id="tm-form" class="hidden" style="margin-bottom:14px"></div>
-      <div class="table-wrap">
-        <table id="tenant-models-table">
-          <thead><tr><th>id</th><th>tenant_id</th><th>model_key</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- ===================== LimitRoles ===================== -->
-    <section class="panel" data-panel="limit-roles">
-      <h2>
-        Limit Roles
-        <span class="count" id="limit-roles-count"></span>
-        <span class="actions"><button class="btn primary small" id="lr-new">+ New</button></span>
-      </h2>
-      <div id="lr-form" class="hidden" style="margin-bottom:14px"></div>
-      <div class="table-wrap">
-        <table id="limit-roles-table">
-          <thead><tr>
-            <th>id</th><th>name</th><th>tenant</th><th>key</th><th>model</th>
-            <th>provider</th><th class="num">count</th><th class="num">token</th>
-            <th>window</th><th>enabled</th><th></th>
-          </tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- ===================== AuthCache ===================== -->
-    <section class="panel" data-panel="auth-cache">
-      <h2>Auth Cache — invalidation (design §11.7 / §13.2)</h2>
-      <p class="muted" style="font-size:12px;margin:0 0 12px">
-        Cache holds <code>sha256(api_key)</code> with a TTL. Invalidation forces
-        the next request for the given key/tenant to re-authenticate against the
-        tenant <code>auth_url</code>.
-      </p>
-      <div class="field-row">
-        <label class="field">
-          <span>tenant_id (optional)</span>
-          <input type="text" id="inv-tenant" placeholder="e.g. t1" />
-        </label>
-        <label class="field">
-          <span>api_keys (comma-separated, optional)</span>
-          <input type="text" id="inv-keys" placeholder="sk-aaa, sk-bbb" />
-        </label>
-      </div>
-      <div>
-        <button class="btn primary" id="inv-btn">Invalidate (DELETE /api/v1/auth/cache)</button>
-      </div>
-      <div id="inv-result" class="hidden" style="margin-top:12px"></div>
-    </section>
-
-    <!-- ===================== Breaker ===================== -->
-    <section class="panel" data-panel="breaker">
-      <h2>
-        Circuit Breaker — dead-set
-        <span class="actions"><button class="btn small" id="breaker-refresh">Refresh</button></span>
-      </h2>
-      <p class="muted" style="font-size:12px;margin:0 0 12px">
-        Dead providers are excluded from candidate selection (§8.4). A background
-        probe task revives them automatically; you can also force a reset here.
-      </p>
-      <div class="table-wrap">
-        <table id="breaker-table">
-          <thead><tr><th>provider_id</th><th>state</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div class="field-row" style="margin-top:12px">
-        <label class="field">
-          <span>force reset by id</span>
-          <input type="text" id="breaker-reset-id" placeholder="provider_id" />
-        </label>
-      </div>
-      <button class="btn primary" id="breaker-reset-btn">Reset (DELETE /api/v1/breaker/&lt;id&gt;)</button>
-    </section>
-
-    <!-- ===================== Health ===================== -->
-    <section class="panel" data-panel="health">
-      <h2>Health <span class="actions"><button class="btn small" id="health-refresh">Refresh</button></span></h2>
-      <pre class="json" id="health-out">{}</pre>
-    </section>
-
-  </main>
+  <!-- Modal + toast mounts -->
+  <div id="modal-root"></div>
+  <div id="toast-root" class="toast-stack" aria-live="polite"></div>
 
   <script src="/admin/app.js"></script>
 </body>
