@@ -469,7 +469,9 @@ impl ConfigStore {
 
 ## 6. 代理请求生命周期
 
-#### 零拷贝与最小拷贝架构（Zero-Copy，强制）
+> **⚠️ 架构变更（待 Oracle 审核）**：正在评估从"零拷贝 stream-through"切换到**"终止模式（Terminate-in-Pingora）"**——在 `request_filter` 内终止请求（读全 body → 用自有 HTTP client 调供应商 → 流式回写），根治 late-model 客户端的 model 提取问题。详见 [`docs/design-change-terminate-mode.md`](design-change-terminate-mode.md)。以下"零拷贝原则"描述的是**当前实现**；变更通过后将更新为本节描述的终止模式。
+
+#### 零拷贝与最小拷贝架构（Zero-Copy，当前实现）
 
 **目标**：请求/响应的**主体载荷**（prompt、token 流）从下游 socket 到上游 socket（及反向）全程**不做 JSON 反复 encode/decode**，仅在必要处对**少量元数据**做扫描式提取，最大化 IO 吞吐。
 

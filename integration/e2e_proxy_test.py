@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""End-to-end proxy test: starts mock LLM + mock auth + Hydra, registers a
+localhost tenant, sends a chat completion through the proxy, verifies the
+response came from the mock LLM, then cleans up everything.
+
+Usage:
+  python3 integration/e2e_proxy_test.py
+  # (assumes hydra is built: cargo build -p hydra-server --features server)
+  # or it will `cargo run` for you.
+
+Prerequisites: python3 (stdlib only). The Hydra binary is started via cargo run.
+"""
+import json, os, signal, subprocess, sys, time, urllib.request, urllib.error
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MOCK_LLM_PORT = 9090
+MOCK_AUTH_PORT = 9091
+HYDRA_PROXY_PORT = 8080
+HYDRA_ADMIN_PORT = 8081
+ADMIN_TOKEN = "e2e-test-token"
+CLIENT_KEY = "e2e-client-key"
+PROVIDER_KEY = "sk-mock-llm-key"
+MODEL = "gpt-4o"
+DB_FILE = os.path.join(ROOT, "e2e_test.db")
+
+_procs = []
+
+def _cleanup():
+    for p in _procs:
+        try:
+            p.terminate()
+            p.wait(timeout=5)
+        except Exception:
+            try: p.kill()
+            except Exception: pass
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+
+def _start(name, cmd, env=None, cwd=None):
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         env=env, cwd=cwd, text=True)
+    _procs.append(p)
+    print(f"[e2e] started {name} (pid={p.pid})")
+    return p
+
+def _wait_ok(url, token=None, timeout=30):
+    hdrs = {}
+    if token:
+        hdrs["Authorization"] = f"Bearer {token}"
+    for _ in range(timeout * 10):
+        try:
+            req = urllib.request.Request(url, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return False
+
+def _admin(method, path, body=None):
+    url = f"http://localhost:{HYDRA_ADMIN_PORT}/api/v1{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {ADMIN_TOKEN}",
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()[:200]
+
+def main():
+    signal.signal(signal.SIGINT, lambda *_: (_cleanup(), sys.exit(130)))
+    signal.signal(signal.SIGTERM, lambda *_: (_cleanup(), sys.exit(143)))
+
+    try:
+        # ── 1. start mocks ──
+        _start("mock-llm", [sys.executable, os.path.join(ROOT, "integration", "mock_llm.py")])
+        _start("mock-auth", [sys.executable, os.path.join(ROOT, "integration", "mock_auth.py")])
+        time.sleep(0.5)
+
+        # ── 2. start Hydra ──
+        env = {**os.environ,
+               "HYDRA_ADMIN_TOKEN": ADMIN_TOKEN,
+               "HYDRA_DB_URL": f"sqlite:{DB_FILE}?mode=rwc",
+               "HYDRA_LISTEN": f"0.0.0.0:{HYDRA_PROXY_PORT}",
+               "HYDRA_ADMIN_ADDR": f"0.0.0.0:{HYDRA_ADMIN_PORT}",
+               "RUST_LOG": "info"}
+        _start("hydra",
+               ["cargo", "run", "-p", "hydra-server", "--features", "server", "--"],
+               env=env, cwd=ROOT)
+
+        # ── 3. wait for health ──
+        print("[e2e] waiting for Hydra health...", flush=True)
+        if not _wait_ok(f"http://localhost:{HYDRA_ADMIN_PORT}/api/v1/health",
+                        token=ADMIN_TOKEN, timeout=40):
+            # dump hydra output for debugging
+            for p in _procs:
+                if p.poll() is not None:
+                    out = p.stdout.read() if p.stdout else ""
+                    print(f"[e2e] process exited: {out[:500]}")
+            print("[e2e] FAIL: Hydra did not become healthy")
+            _cleanup(); sys.exit(1)
+        print("[e2e] Hydra healthy ✓", flush=True)
+
+        # ── 4. register config ──
+        steps = [
+            ("provider", "/providers",
+             {"id": "mock", "key": "mock", "name": "Mock LLM",
+              "endpoint": f"http://localhost:{MOCK_LLM_PORT}", "weight": 1,
+              "created_at": "", "updated_at": ""}),
+            ("model", "/provider-models",
+             {"id": "mm", "key": MODEL, "name": "GPT-4o Mock",
+              "provider_id": "mock", "status": 1,
+              "created_at": "", "updated_at": ""}),
+            ("key", "/provider-keys",
+             {"id": "mk", "provider_id": "mock", "api_key": PROVIDER_KEY,
+              "created_at": ""}),
+            ("tenant", "/tenants",
+             {"id": "local", "name": "Local", "domain": "localhost",
+              "auth_url": f"http://localhost:{MOCK_AUTH_PORT}", "enabled": True,
+              "cert_key": None, "cert_file": None,
+              "created_at": "", "updated_at": ""}),
+            ("tenant-provider", "/tenant-providers",
+             {"id": "tp", "tenant_id": "local", "provider_id": "mock",
+              "created_at": "", "updated_at": ""}),
+            ("tenant-model", "/tenant-models",
+             {"id": "tm", "tenant_id": "local", "model_key": MODEL,
+              "created_at": "", "updated_at": ""}),
+        ]
+        for label, path, body in steps:
+            s, j = _admin("POST", path, body)
+            assert s in (200, 201), f"[e2e] FAIL: register {label} -> {s}: {j}"
+        print("[e2e] config registered (provider + model + key + tenant + associations) ✓", flush=True)
+
+        # ── 5. send chat completion through the proxy ──
+        chat_body = json.dumps({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello, mock LLM!"}],
+        }).encode()
+        req = urllib.request.Request(
+            f"http://localhost:{HYDRA_PROXY_PORT}/v1/chat/completions",
+            data=chat_body, method="POST",
+            headers={
+                "Authorization": f"Bearer {CLIENT_KEY}",
+                "Content-Type": "application/json",
+                "Host": "localhost",
+            })
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                resp = json.loads(r.read())
+                content = (resp.get("choices", [{}])[0]
+                           .get("message", {}).get("content", ""))
+                usage = resp.get("usage", {})
+                if "Hello from mock LLM" in content:
+                    print(f"[e2e] SUCCESS ✓ proxy returned mock LLM response:")
+                    print(f'       content = "{content}"')
+                    print(f'       usage   = {usage}')
+                else:
+                    print(f"[e2e] FAIL: unexpected response: {json.dumps(resp)[:300]}")
+                    _cleanup(); sys.exit(1)
+        except Exception as e:
+            print(f"[e2e] FAIL: proxy request error: {e}")
+            _cleanup(); sys.exit(1)
+
+        # ── 6. cleanup ──
+        _cleanup()
+        print("[e2e] all stopped. PASSED ✓")
+
+    except Exception as e:
+        print(f"[e2e] ERROR: {e}")
+        _cleanup()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
