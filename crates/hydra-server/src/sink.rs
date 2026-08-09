@@ -251,9 +251,10 @@ async fn insert_batch_sqlite(
         sqlx::query(
             "INSERT INTO usage_record \
              (tenant_id, provider_id, model_key, client_api_key, status_code, \
-              prompt_tokens, completion_tokens, total_tokens, latency_ms, \
+              prompt_tokens, completion_tokens, total_tokens, cached_tokens, \
+              latency_ms, forward_latency_ms, ttft_ms, \
               upstream_host, error, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&r.tenant_id)
         .bind(&r.provider_id)
@@ -263,7 +264,10 @@ async fn insert_batch_sqlite(
         .bind(r.prompt_tokens.map(|v| v as i64))
         .bind(r.completion_tokens.map(|v| v as i64))
         .bind(r.total_tokens.map(|v| v as i64))
+        .bind(r.cached_tokens.map(|v| v as i64))
         .bind(r.latency_ms as i64)
+        .bind(r.forward_latency_ms.map(|v| v as i64))
+        .bind(r.ttft_ms.map(|v| v as i64))
         .bind(&r.upstream_host)
         .bind(&r.error)
         .bind(&r.created_at)
@@ -409,7 +413,8 @@ fn parse_clickhouse_url(url: &str) -> ClickHouseConfig {
 #[cfg(feature = "usage-clickhouse")]
 const CLICKHOUSE_INSERT: &str =
     "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, status_code, \
-     prompt_tokens, completion_tokens, total_tokens, latency_ms, upstream_host, error, created_at) \
+     prompt_tokens, completion_tokens, total_tokens, cached_tokens, latency_ms, \
+     forward_latency_ms, ttft_ms, upstream_host, error, created_at) \
      FORMAT JSONEachRow";
 
 /// Insert a batch into ClickHouse over HTTP. On failure returns the error
@@ -503,8 +508,14 @@ fn build_clickhouse_json_row_into(out: &mut String, r: &UsageRecord) {
     json_opt_u64_into(out, r.completion_tokens);
     out.push_str(",\"total_tokens\":");
     json_opt_u64_into(out, r.total_tokens);
+    out.push_str(",\"cached_tokens\":");
+    json_opt_u64_into(out, r.cached_tokens);
     out.push_str(",\"latency_ms\":");
     out.push_str(&r.latency_ms.to_string());
+    out.push_str(",\"forward_latency_ms\":");
+    json_opt_u64_into(out, r.forward_latency_ms);
+    out.push_str(",\"ttft_ms\":");
+    json_opt_u64_into(out, r.ttft_ms);
     out.push_str(",\"upstream_host\":");
     match &r.upstream_host {
         Some(v) => json_string_into(out, v),

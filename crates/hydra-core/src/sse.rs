@@ -143,6 +143,10 @@ impl UsageScanner {
                 self.usage.prompt_tokens = u.prompt_tokens.or(u.input_tokens);
                 self.usage.completion_tokens = u.completion_tokens.or(u.output_tokens);
                 self.usage.total_tokens = u.total_tokens;
+                self.usage.cached_tokens = u
+                    .prompt_tokens_details
+                    .and_then(|d| d.cached_tokens)
+                    .or(u.cached_tokens);
                 self.seen_any = true;
                 true
             }
@@ -154,6 +158,10 @@ impl UsageScanner {
                 };
                 accumulate(&mut self.usage.prompt_tokens, u.input_tokens);
                 accumulate(&mut self.usage.completion_tokens, u.output_tokens);
+                // Anthropic reports cache reads via `cache_read_input_tokens`.
+                // It is a running total (not a delta) on the final usage object,
+                // so last-wins (not accumulate) is correct.
+                accumulate(&mut self.usage.cached_tokens, u.cache_read_input_tokens);
                 self.seen_any = true;
                 true
             }
@@ -281,10 +289,30 @@ struct OpenAiUsageFields {
     input_tokens: Option<u64>,
     /// Generic-provider fallback field name.
     output_tokens: Option<u64>,
+    /// OpenAI prompt-cache breakdown (`usage.prompt_tokens_details`).
+    /// `#[serde(default)]` so its absence does not fail deserialisation.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Generic-provider fallback: a top-level `cached_tokens` (some
+    /// OpenAI-compatible gateways surface it outside the details sub-object).
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+/// OpenAI `usage.prompt_tokens_details` — currently only `cached_tokens` is
+/// interesting. Unknown fields are ignored; a missing sub-object is tolerated
+/// via the `Option` on the parent.
+#[derive(Deserialize, Default)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct AnthropicUsageFields {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    /// Anthropic prompt-cache read hits (mirrors OpenAI `cached_tokens`).
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
 }

@@ -440,6 +440,13 @@ impl ProxyHttp for HydraProxy {
                 &body_bytes,
                 &ctx.trace_id,
             );
+            // forward_latency_ms: Hydra's own overhead (auth + routing + body
+            // read) = request start → just before the upstream send. Captured
+            // once (first attempt): on failover the additional elapsed time is
+            // upstream-connect failure, not Hydra overhead. (design §9.1.)
+            if ctx.forward_latency_ms.is_none() {
+                ctx.forward_latency_ms = Some(ctx.started_at.elapsed().as_millis() as u64);
+            }
             ctx.upstream_started_at = Some(Instant::now());
             let send_result = self.provider_client.send(req).await;
 
@@ -631,6 +638,23 @@ impl ProxyHttp for HydraProxy {
                         c,
                     );
                 }
+                if let Some(cached) = u.cached_tokens {
+                    crate::admin::metrics::record_cached_tokens(
+                        &tenant.id,
+                        &sel.provider_id,
+                        &model,
+                        cached,
+                    );
+                }
+            }
+            // TTFT histogram (only when a first chunk was observed).
+            if let Some(ttft_ms) = ctx.ttft_ms {
+                crate::admin::metrics::record_ttft(
+                    &tenant.id,
+                    &sel.provider_id,
+                    &model,
+                    ttft_ms as f64 / 1000.0,
+                );
             }
         }
 
@@ -649,7 +673,10 @@ impl ProxyHttp for HydraProxy {
                 prompt_tokens: usage.as_ref().and_then(|u| u.prompt_tokens),
                 completion_tokens: usage.as_ref().and_then(|u| u.completion_tokens),
                 total_tokens: usage.as_ref().and_then(|u| u.total_tokens),
+                cached_tokens: usage.as_ref().and_then(|u| u.cached_tokens),
                 latency_ms,
+                forward_latency_ms: ctx.forward_latency_ms,
+                ttft_ms: ctx.ttft_ms,
                 upstream_host: ctx.upstream_host.clone(),
                 error: _e.map(|e| e.to_string()),
                 trace_id: ctx.trace_id.clone(),
@@ -744,11 +771,19 @@ impl HydraProxy {
             .await?;
 
         // Stream body chunks: scan for usage (memchr) + write downstream.
+        // TTFT (Time To First Token): elapsed from request start → the first
+        // response chunk received from the provider. Captured once on the first
+        // chunk (design §9.1).
+        let mut first_chunk = true;
         while let Some(chunk) = resp
             .chunk()
             .await
             .map_err(|e| pingora_err(format!("upstream stream read error: {e}")))?
         {
+            if first_chunk {
+                first_chunk = false;
+                ctx.ttft_ms = Some(ctx.started_at.elapsed().as_millis() as u64);
+            }
             // memchr usage scan over the chunk (zero-alloc common path).
             let _ = ctx.scanner.scan_chunk(chunk.as_ref());
             session.write_response_body(Some(chunk), false).await?;

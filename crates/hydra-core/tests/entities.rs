@@ -142,6 +142,7 @@ fn entities_derive_roundtrip() {
         prompt_tokens: Some(120),
         completion_tokens: Some(80),
         total_tokens: Some(200),
+        cached_tokens: Some(15),
     };
     let usage_back = roundtrip(&usage_full);
     assert_eq!(usage_full, usage_back);
@@ -155,7 +156,10 @@ fn entities_derive_roundtrip() {
         prompt_tokens: Some(120),
         completion_tokens: Some(80),
         total_tokens: Some(200),
+        cached_tokens: Some(15),
         latency_ms: 1234,
+        forward_latency_ms: Some(12),
+        ttft_ms: Some(340),
         upstream_host: Some("api.openai.com".into()),
         error: None,
         trace_id: "trace-001".into(),

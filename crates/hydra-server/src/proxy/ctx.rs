@@ -59,6 +59,16 @@ pub struct RequestContext {
     pub status_code: u16,
     /// Upstream host actually contacted (for the usage record).
     pub upstream_host: Option<String>,
+    /// Hydra's own overhead: elapsed from `started_at` to just before the
+    /// successful upstream `send` (auth + routing + body read). `None` when no
+    /// upstream attempt succeeded far enough to send. Written in the failover
+    /// loop; read by `logging` → `UsageRecord::forward_latency_ms`.
+    pub forward_latency_ms: Option<u64>,
+    /// Time To First Token: elapsed from `started_at` to the first response
+    /// chunk received from the provider. `None` for non-streamed / errored
+    /// requests that produced no chunk. Written during the stream-back loop;
+    /// read by `logging` → `UsageRecord::ttft_ms`.
+    pub ttft_ms: Option<u64>,
     /// Incremental usage scanner (memchr over response chunks; §9.4). Mutated
     /// during the stream-back loop; finalised in `logging`.
     pub scanner: UsageScanner,
@@ -84,6 +94,8 @@ impl RequestContext {
             upstream_started_at: None,
             status_code: 0,
             upstream_host: None,
+            forward_latency_ms: None,
+            ttft_ms: None,
             // Generic (OpenAI-compatible) schema by default; the SSE scanner
             // normalises the small usage object per provider family.
             scanner: UsageScanner::new(hydra_core::model::ProviderKind::Generic),

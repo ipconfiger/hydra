@@ -9,7 +9,10 @@ CREATE TABLE IF NOT EXISTS usage_record (
     prompt_tokens      Nullable(UInt64),
     completion_tokens  Nullable(UInt64),
     total_tokens       Nullable(UInt64),
+    cached_tokens      Nullable(UInt64),
     latency_ms         UInt32,
+    forward_latency_ms Nullable(UInt32),
+    ttft_ms            Nullable(UInt32),
     upstream_host      Nullable(String),
     error              Nullable(String),
     created_at         String

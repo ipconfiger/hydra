@@ -23,6 +23,8 @@
 //! | `hydra_limit_rejected_total` | counter | tenant, role, dim | proxy `request_filter` (429) |
 //! | `hydra_sni_host_mismatch_total` | counter | — | `tls::note_sni_host_mismatch` (W4b) |
 //! | `hydra_route_errors_total` | counter | tenant, reason | proxy `request_filter` (route err) |
+//! | `hydra_ttft_seconds` | histogram | tenant, provider, model | proxy `logging` (time to first token) |
+//! | `hydra_cached_tokens_total` | counter | tenant, provider, model | proxy `logging` (prompt-cache hits) |
 //!
 //! The record helpers tolerate a `None` handle (failed registration) by becoming
 //! a cheap no-op, so instrumentation can never break the hot path. The
@@ -57,6 +59,11 @@ struct Metrics {
     breaker_transitions: IntCounterVec,
     limit_rejected: IntCounterVec,
     route_errors: IntCounterVec,
+    /// Time To First Token (request start → first response chunk).
+    ttft: HistogramVec,
+    /// Prompt-cache hit token count (OpenAI cached_tokens / Anthropic
+    /// cache_read_input_tokens).
+    cached_tokens: IntCounterVec,
 }
 
 /// The SNI/Host mismatch counter name, registered by the W4b `tls` module. Kept
@@ -136,6 +143,19 @@ fn metrics() -> Option<&'static Metrics> {
                 "hydra_route_errors_total",
                 "Routing failures",
                 &["tenant", "reason"]
+            )
+            .ok()?,
+            ttft: register_histogram_vec!(
+                "hydra_ttft_seconds",
+                "Time to first token (request start → first response chunk)",
+                &["tenant", "provider", "model"],
+                LATENCY_BUCKETS.to_vec()
+            )
+            .ok()?,
+            cached_tokens: register_int_counter_vec!(
+                "hydra_cached_tokens_total",
+                "Prompt-cache hit tokens (cached_tokens / cache_read_input_tokens)",
+                &["tenant", "provider", "model"]
             )
             .ok()?,
         })
@@ -258,6 +278,27 @@ pub fn record_route_error(tenant: &str, reason: &str) {
     }
 }
 
+/// Observe Time To First Token in seconds (`ttft_ms / 1000.0`).
+#[allow(dead_code)]
+pub fn record_ttft(tenant: &str, provider: &str, model: &str, secs: f64) {
+    if let Some(m) = metrics() {
+        m.ttft
+            .with_label_values(&[tenant, provider, model])
+            .observe(secs);
+    }
+}
+
+/// Increment prompt-cache hit tokens by `n` (OpenAI `cached_tokens` /
+/// Anthropic `cache_read_input_tokens`).
+#[allow(dead_code)]
+pub fn record_cached_tokens(tenant: &str, provider: &str, model: &str, n: u64) {
+    if let Some(m) = metrics() {
+        m.cached_tokens
+            .with_label_values(&[tenant, provider, model])
+            .inc_by(n);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // /metrics rendering (default registry)
 // ---------------------------------------------------------------------------
@@ -309,6 +350,8 @@ mod tests {
         record_upstream_duration("p", "m", 0.1);
         record_request_duration("t", "p", "m", 0.2);
         record_auth_upstream_error("t");
+        record_ttft("t", "p", "m", 0.35);
+        record_cached_tokens("t", "p", "m", 42);
     }
 
     #[test]

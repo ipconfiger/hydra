@@ -33,7 +33,10 @@ fn rec(i: u32) -> UsageRecord {
         prompt_tokens: Some(10 + i as u64),
         completion_tokens: Some(20 + i as u64),
         total_tokens: Some(30 + i as u64 * 2),
+        cached_tokens: Some(i as u64),
         latency_ms: 100 + i as u64,
+        forward_latency_ms: Some(5 + i as u64),
+        ttft_ms: Some(50 + i as u64),
         upstream_host: Some("upstream.example".to_string()),
         error: None,
         trace_id: format!("trace-{i}"),
@@ -190,7 +193,9 @@ async fn sink_backoff_on_db_error() {
          tenant_id TEXT NOT NULL, provider_id TEXT NOT NULL, model_key TEXT NOT NULL, \
          client_api_key TEXT, status_code INTEGER NOT NULL, \
          prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, \
-         latency_ms INTEGER NOT NULL, upstream_host TEXT, error TEXT, \
+         cached_tokens INTEGER, \
+         latency_ms INTEGER NOT NULL, forward_latency_ms INTEGER, ttft_ms INTEGER, \
+         upstream_host TEXT, error TEXT, \
          created_at TEXT NOT NULL DEFAULT (datetime('now')))",
     )
     .execute(&pool)
@@ -264,6 +269,84 @@ async fn sink_drop_drains() {
         count_usage(&pool).await
     };
     assert_eq!(count, 5, "Drop must flush the 5 remaining buffered records");
+}
+
+// ---------------------------------------------------------------------------
+// T3.7 — new metrics dimensions (cached_tokens / forward_latency_ms / ttft_ms)
+//         are persisted by the SqliteSink INSERT.
+// ---------------------------------------------------------------------------
+
+/// The 0002 migration columns are written by the sink. Verifies the full
+/// INSERT path round-trips the three new (nullable) dimensions into SQLite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sink_persists_new_metrics_columns() {
+    let pool = common::setup_pool().await;
+
+    let sink = SqliteSink::new(pool.clone(), 1, 3600);
+    sink.record(rec(2)).await;
+
+    for _ in 0..50 {
+        if count_usage(&pool).await == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(count_usage(&pool).await, 1);
+
+    // rec(2) ⇒ cached_tokens=2, forward_latency_ms=7, ttft_ms=52.
+    let row = sqlx::query(
+        "SELECT cached_tokens, forward_latency_ms, ttft_ms FROM usage_record \
+         WHERE tenant_id = ?",
+    )
+    .bind("tenant-2")
+    .fetch_one(&pool)
+    .await
+    .expect("select new metrics");
+    let cached: Option<i64> = row.get("cached_tokens");
+    let fwd: Option<i64> = row.get("forward_latency_ms");
+    let ttft: Option<i64> = row.get("ttft_ms");
+    assert_eq!(cached, Some(2), "cached_tokens persisted");
+    assert_eq!(fwd, Some(7), "forward_latency_ms persisted");
+    assert_eq!(ttft, Some(52), "ttft_ms persisted");
+}
+
+/// When the new dimensions are `None` the columns persist as SQL NULL
+/// (nullable schema — pre-existing rows and providers that omit the fields
+/// keep working).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sink_new_metrics_null_when_absent() {
+    let pool = common::setup_pool().await;
+
+    let mut r = rec(0);
+    r.cached_tokens = None;
+    r.forward_latency_ms = None;
+    r.ttft_ms = None;
+
+    let sink = SqliteSink::new(pool.clone(), 1, 3600);
+    sink.record(r).await;
+    drop(sink);
+
+    for _ in 0..50 {
+        if count_usage(&pool).await == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let row = sqlx::query(
+        "SELECT cached_tokens, forward_latency_ms, ttft_ms FROM usage_record \
+         WHERE tenant_id = ?",
+    )
+    .bind("tenant-0")
+    .fetch_one(&pool)
+    .await
+    .expect("select null metrics");
+    let cached: Option<i64> = row.get("cached_tokens");
+    let fwd: Option<i64> = row.get("forward_latency_ms");
+    let ttft: Option<i64> = row.get("ttft_ms");
+    assert_eq!(cached, None, "cached_tokens None ⇒ NULL");
+    assert_eq!(fwd, None, "forward_latency_ms None ⇒ NULL");
+    assert_eq!(ttft, None, "ttft_ms None ⇒ NULL");
 }
 
 // ---------------------------------------------------------------------------

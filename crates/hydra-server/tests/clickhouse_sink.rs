@@ -26,7 +26,10 @@ fn sample() -> UsageRecord {
         prompt_tokens: Some(12),
         completion_tokens: Some(34),
         total_tokens: Some(46),
+        cached_tokens: Some(5),
         latency_ms: 250,
+        forward_latency_ms: Some(8),
+        ttft_ms: Some(180),
         upstream_host: Some("upstream.example".to_string()),
         error: None,
         trace_id: "trace-1".to_string(),
@@ -34,7 +37,8 @@ fn sample() -> UsageRecord {
     }
 }
 
-// The 12 `usage_record` columns, in declaration order (migrations/0001_init.sql).
+// The `usage_record` columns, in declaration order
+// (migrations/0001_init.sql + 0002_usage_metrics.sql).
 const USAGE_COLUMNS: &[&str] = &[
     "tenant_id",
     "provider_id",
@@ -44,7 +48,10 @@ const USAGE_COLUMNS: &[&str] = &[
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
+    "cached_tokens",
     "latency_ms",
+    "forward_latency_ms",
+    "ttft_ms",
     "upstream_host",
     "error",
     "created_at",
@@ -87,6 +94,44 @@ fn clickhouse_json_row_matches_usage_record_schema() {
     assert!(
         json.contains("\"prompt_tokens\":12"),
         "Option<u64>::Some must be a bare number: {json}"
+    );
+    // New metrics dimensions are bare numbers (Some) — not quoted, not null.
+    assert!(
+        json.contains("\"cached_tokens\":5"),
+        "cached_tokens Some must be a bare number: {json}"
+    );
+    assert!(
+        json.contains("\"forward_latency_ms\":8"),
+        "forward_latency_ms Some must be a bare number: {json}"
+    );
+    assert!(
+        json.contains("\"ttft_ms\":180"),
+        "ttft_ms Some must be a bare number: {json}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T4.2c — new latency/token dimensions render as JSON null when None
+// ---------------------------------------------------------------------------
+
+#[test]
+fn clickhouse_json_row_new_metrics_null_when_absent() {
+    let mut r = sample();
+    r.cached_tokens = None;
+    r.forward_latency_ms = None;
+    r.ttft_ms = None;
+    let json = build_clickhouse_json_row(&r);
+    assert!(
+        json.contains("\"cached_tokens\":null"),
+        "cached_tokens None must be null: {json}"
+    );
+    assert!(
+        json.contains("\"forward_latency_ms\":null"),
+        "forward_latency_ms None must be null: {json}"
+    );
+    assert!(
+        json.contains("\"ttft_ms\":null"),
+        "ttft_ms None must be null: {json}"
     );
 }
 

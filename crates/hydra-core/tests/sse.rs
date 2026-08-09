@@ -29,6 +29,7 @@ fn usage_scan_finds_usage_memchr() {
             prompt_tokens: Some(3),
             completion_tokens: Some(4),
             total_tokens: Some(7),
+            ..Default::default()
         })
     );
 }
@@ -47,6 +48,7 @@ fn usage_openai_final_chunk() {
             prompt_tokens: Some(100),
             completion_tokens: Some(50),
             total_tokens: Some(150),
+            ..Default::default()
         })
     );
 }
@@ -64,6 +66,7 @@ fn usage_anthropic_message_delta() {
             completion_tokens: Some(8),
             // Anthropic omits total ⇒ computed as prompt + completion.
             total_tokens: Some(20),
+            ..Default::default()
         })
     );
 }
@@ -86,6 +89,7 @@ fn usage_anthropic_incremental_accumulate() {
             prompt_tokens: Some(40),     // single input_tokens occurrence
             completion_tokens: Some(10), // 5 + 3 + 2 accumulated
             total_tokens: Some(50),      // computed
+            ..Default::default()
         })
     );
 }
@@ -103,6 +107,7 @@ fn usage_done_marker() {
             prompt_tokens: Some(1),
             completion_tokens: Some(1),
             total_tokens: Some(2),
+            ..Default::default()
         })
     );
 }
@@ -123,6 +128,7 @@ fn usage_cross_chunk_boundary() {
             prompt_tokens: Some(9),
             completion_tokens: Some(1),
             total_tokens: Some(10),
+            ..Default::default()
         })
     );
 }
@@ -139,6 +145,7 @@ fn usage_non_stream_json() {
             prompt_tokens: Some(7),
             completion_tokens: Some(14),
             total_tokens: Some(21),
+            ..Default::default()
         })
     );
 }
@@ -193,6 +200,7 @@ fn usage_malformed_chunk_skipped() {
             prompt_tokens: Some(2),
             completion_tokens: Some(2),
             total_tokens: Some(4),
+            ..Default::default()
         })
     );
 }
@@ -207,4 +215,69 @@ fn usage_openai_no_include_usage() {
     scanner.scan_chunk(b"data: [DONE]\n");
     // No usage ever observed.
     assert_eq!(scanner.finalize(), None);
+}
+
+// T5.20 — OpenAI `usage.prompt_tokens_details.cached_tokens` ⇒ cached_tokens.
+#[test]
+fn usage_openai_cached_tokens_from_details() {
+    let mut scanner = UsageScanner::new(ProviderKind::OpenAi);
+    let chunk = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150,\"prompt_tokens_details\":{\"cached_tokens\":42}}}\n";
+    assert_eq!(scanner.scan_chunk(chunk), ScanResult::Found);
+    assert_eq!(
+        scanner.finalize(),
+        Some(Usage {
+            prompt_tokens: Some(100),
+            completion_tokens: Some(50),
+            total_tokens: Some(150),
+            cached_tokens: Some(42),
+        })
+    );
+}
+
+// T5.20b — OpenAI usage WITHOUT `prompt_tokens_details` ⇒ cached_tokens None.
+#[test]
+fn usage_openai_no_details_cached_tokens_none() {
+    let mut scanner = UsageScanner::new(ProviderKind::OpenAi);
+    let chunk = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150}}\n";
+    scanner.scan_chunk(chunk);
+    let u = scanner.finalize().expect("usage");
+    assert_eq!(u.cached_tokens, None);
+}
+
+// T5.20c — Anthropic `cache_read_input_tokens` ⇒ cached_tokens.
+#[test]
+fn usage_anthropic_cached_tokens() {
+    let mut scanner = UsageScanner::new(ProviderKind::Anthropic);
+    let chunk = b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":120,\"output_tokens\":30,\"cache_read_input_tokens\":77}}\n\n";
+    assert_eq!(scanner.scan_chunk(chunk), ScanResult::Found);
+    assert_eq!(
+        scanner.finalize(),
+        Some(Usage {
+            prompt_tokens: Some(120),
+            completion_tokens: Some(30),
+            total_tokens: Some(150),
+            cached_tokens: Some(77),
+        })
+    );
+}
+
+// T5.20d — Generic provider surfacing a top-level `cached_tokens`.
+#[test]
+fn usage_generic_top_level_cached_tokens() {
+    let mut scanner = UsageScanner::new(ProviderKind::Generic);
+    let chunk = b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"cached_tokens\":8}}\n";
+    scanner.scan_chunk(chunk);
+    let u = scanner.finalize().expect("generic usage");
+    assert_eq!(u.cached_tokens, Some(8));
+}
+
+// T5.20e — OpenAI details present but `cached_tokens` key absent ⇒ None.
+#[test]
+fn usage_openai_details_without_cached_field() {
+    let mut scanner = UsageScanner::new(ProviderKind::OpenAi);
+    // `prompt_tokens_details` present with an unrelated field only.
+    let chunk = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"total_tokens\":5,\"prompt_tokens_details\":{\"audio_tokens\":1}}}\n";
+    scanner.scan_chunk(chunk);
+    let u = scanner.finalize().expect("usage");
+    assert_eq!(u.cached_tokens, None);
 }

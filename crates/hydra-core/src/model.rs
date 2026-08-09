@@ -160,15 +160,32 @@ pub enum ProviderKind {
 
 /// Normalised token usage. All fields optional: some providers omit them
 /// (e.g. OpenAI without `stream_options.include_usage`).
+///
+/// `cached_tokens` captures prompt-cache hits: OpenAI exposes it as
+/// `usage.prompt_tokens_details.cached_tokens`, Anthropic as
+/// `usage.cache_read_input_tokens`. `None` when the provider does not report
+/// it (so the dimension is simply absent, not zero).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    /// Prompt-cache hit token count (OpenAI `cached_tokens` /
+    /// Anthropic `cache_read_input_tokens`). `None` when unreported.
+    pub cached_tokens: Option<u64>,
 }
 
 /// A persisted usage record (design §9.1). `created_at` is ISO-8601 text
 /// (no `chrono` in core). The api-key is always the masked form (§9.5).
+///
+/// Latency dimensions:
+/// - `latency_ms` — end-to-end wall clock (request start → response complete).
+/// - `forward_latency_ms` — Hydra's own overhead: request start → just before
+///   the upstream `send` (auth + routing + body read). `None` when no upstream
+///   attempt was made.
+/// - `ttft_ms` — Time To First Token: request start → first response chunk
+///   received from the provider. `None` for non-streamed / errored requests
+///   that never produced a chunk.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub tenant_id: String,
@@ -179,7 +196,13 @@ pub struct UsageRecord {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    /// Prompt-cache hit tokens (mirrors [`Usage::cached_tokens`]).
+    pub cached_tokens: Option<u64>,
     pub latency_ms: u64,
+    /// Hydra overhead: request start → just before upstream send.
+    pub forward_latency_ms: Option<u64>,
+    /// Time To First Token: request start → first response chunk.
+    pub ttft_ms: Option<u64>,
     pub upstream_host: Option<String>,
     pub error: Option<String>,
     pub trace_id: String,
