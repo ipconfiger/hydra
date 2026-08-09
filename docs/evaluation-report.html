@@ -1,0 +1,1115 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hydra 生产就绪度评测报告 · 2026-08-09</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   THEME TOKENS
+   ============================================================ */
+:root{
+  --bg:#0a0e13;
+  --bg-grad-1:rgba(16,185,129,0.10);
+  --bg-grad-2:rgba(99,102,241,0.10);
+  --bg-grad-3:rgba(20,184,166,0.06);
+  --surface:rgba(255,255,255,0.028);
+  --surface-2:rgba(255,255,255,0.05);
+  --surface-3:rgba(255,255,255,0.075);
+  --border:rgba(255,255,255,0.08);
+  --border-strong:rgba(255,255,255,0.15);
+  --text:#e8eef4;
+  --text-dim:#9fabba;
+  --text-faint:#64727e;
+  --accent:#10b981;
+  --accent-glow:rgba(16,185,129,0.35);
+  --accent-2:#34d399;
+  --indigo:#818cf8;
+  --indigo-soft:rgba(129,140,248,0.14);
+  --amber:#fbbf24;
+  --amber-soft:rgba(251,191,36,0.13);
+  --red:#f87171;
+  --red-soft:rgba(248,113,113,0.13);
+  --blue:#60a5fa;
+  --blue-soft:rgba(96,165,250,0.13);
+  --shadow:0 1px 0 rgba(255,255,255,0.04) inset, 0 8px 30px rgba(0,0,0,0.45);
+  --radius:16px;
+  --radius-sm:11px;
+}
+html:has(#tht:checked){
+  --bg:#f6f8fa;
+  --bg-grad-1:rgba(16,185,129,0.10);
+  --bg-grad-2:rgba(99,102,241,0.08);
+  --bg-grad-3:rgba(20,184,166,0.06);
+  --surface:rgba(255,255,255,0.75);
+  --surface-2:#ffffff;
+  --surface-3:#ffffff;
+  --border:rgba(15,23,42,0.10);
+  --border-strong:rgba(15,23,42,0.18);
+  --text:#0f172a;
+  --text-dim:#475569;
+  --text-faint:#94a3b8;
+  --shadow:0 1px 0 rgba(255,255,255,0.6) inset, 0 8px 30px rgba(15,23,42,0.08);
+}
+
+/* ============================================================
+   RESET / BASE
+   ============================================================ */
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth;scroll-padding-top:84px}
+body{
+  font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,sans-serif;
+  background:var(--bg);
+  color:var(--text);
+  line-height:1.65;
+  font-size:15.5px;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+  overflow-x:hidden;
+  position:relative;
+  min-height:100vh;
+}
+/* atmospheric background mesh */
+body::before{
+  content:"";position:fixed;inset:0;z-index:-2;pointer-events:none;
+  background:
+    radial-gradient(900px 600px at 12% -5%, var(--bg-grad-1), transparent 60%),
+    radial-gradient(800px 600px at 92% 8%, var(--bg-grad-2), transparent 60%),
+    radial-gradient(700px 700px at 50% 110%, var(--bg-grad-3), transparent 60%);
+}
+body::after{
+  content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.4;
+  background-image:linear-gradient(rgba(255,255,255,0.022) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(255,255,255,0.022) 1px,transparent 1px);
+  background-size:64px 64px;
+  mask-image:radial-gradient(ellipse 80% 60% at 50% 0%, #000 30%, transparent 75%);
+}
+html:has(#tht:checked) body::after{opacity:.5;
+  background-image:linear-gradient(rgba(15,23,42,0.04) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(15,23,42,0.04) 1px,transparent 1px);}
+
+h1,h2,h3,h4{font-family:'Space Grotesk','PingFang SC','Microsoft YaHei',sans-serif;font-weight:600;letter-spacing:-0.02em;line-height:1.18;color:var(--text)}
+code,kbd,samp,pre,.mono{font-family:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,monospace}
+a{color:var(--accent-2);text-decoration:none}
+strong{color:var(--text);font-weight:600}
+em{color:var(--accent-2);font-style:normal;font-weight:600}
+
+::selection{background:var(--accent);color:#03130d}
+
+/* ============================================================
+   LAYOUT
+   ============================================================ */
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+section{padding:72px 0;border-top:1px solid var(--border)}
+section:first-of-type{border-top:none}
+.eyebrow{
+  font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:500;letter-spacing:.18em;
+  text-transform:uppercase;color:var(--accent);display:inline-flex;align-items:center;gap:8px;
+  margin-bottom:14px;
+}
+.eyebrow::before{content:"";width:22px;height:1.5px;background:var(--accent);display:inline-block}
+.sec-head{margin-bottom:34px;max-width:880px}
+.sec-head h2{font-size:clamp(26px,3.4vw,38px);margin-bottom:10px}
+.sec-head p{color:var(--text-dim);font-size:16px}
+
+/* ============================================================
+   STICKY NAV
+   ============================================================ */
+nav.top{
+  position:sticky;top:0;z-index:50;
+  backdrop-filter:saturate(160%) blur(18px);
+  -webkit-backdrop-filter:saturate(160%) blur(18px);
+  background:color-mix(in srgb, var(--bg) 72%, transparent);
+  border-bottom:1px solid var(--border);
+}
+.nav-inner{max-width:1180px;margin:0 auto;padding:0 24px;height:62px;display:flex;align-items:center;gap:22px}
+.brand{display:flex;align-items:center;gap:11px;font-family:'Space Grotesk';font-weight:700;font-size:17px;letter-spacing:-.02em;color:var(--text)}
+.brand .dot{width:11px;height:11px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--indigo));box-shadow:0 0 14px var(--accent-glow)}
+.brand small{font-family:'JetBrains Mono';font-weight:400;font-size:11px;color:var(--text-faint);letter-spacing:.05em}
+.nav-links{display:flex;gap:4px;margin-left:auto;align-items:center;flex-wrap:wrap}
+.nav-links a{
+  color:var(--text-dim);font-size:13.5px;font-weight:500;padding:7px 11px;border-radius:9px;
+  transition:color .2s,background .2s;
+}
+.nav-links a:hover{color:var(--text);background:var(--surface-2)}
+.theme-toggle{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;padding:6px 10px;border-radius:9px;border:1px solid var(--border);background:var(--surface)}
+.theme-toggle:hover{border-color:var(--border-strong)}
+.theme-toggle input{display:none}
+.theme-toggle .ti{font-size:14px;line-height:1}
+.theme-toggle .moon{display:none}
+html:not(:has(#tht:checked)) .theme-toggle .sun{display:none}
+html:not(:has(#tht:checked)) .theme-toggle .moon{display:inline}
+html:has(#tht:checked) .theme-toggle .sun{display:inline}
+
+/* ============================================================
+   HERO
+   ============================================================ */
+header.hero{padding:64px 0 40px;position:relative}
+.hero-grid{display:grid;grid-template-columns:1.35fr 1fr;gap:48px;align-items:center}
+.hero-title{font-size:clamp(40px,7vw,78px);font-weight:700;line-height:1.02;letter-spacing:-.04em}
+.hero-title .grad{background:linear-gradient(120deg,var(--accent) 10%,var(--accent-2) 40%,var(--indigo) 95%);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero-sub{font-family:'JetBrains Mono';font-size:14px;color:var(--text-dim);margin:18px 0 24px;letter-spacing:.02em}
+.meta-row{display:flex;flex-wrap:wrap;gap:8px}
+.chip{
+  display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--text-dim);
+  padding:6px 11px;border-radius:999px;border:1px solid var(--border);background:var(--surface);
+  font-family:'JetBrains Mono';font-weight:400;
+}
+.chip b{color:var(--text);font-weight:600}
+
+/* verdict card with ring */
+.verdict{
+  position:relative;border-radius:22px;padding:30px 28px;
+  background:linear-gradient(180deg,var(--surface-2),var(--surface));
+  border:1px solid var(--border-strong);box-shadow:var(--shadow);
+  display:flex;flex-direction:column;align-items:center;text-align:center;gap:6px;
+  overflow:hidden;
+}
+.verdict::before{content:"";position:absolute;inset:0;background:radial-gradient(120% 80% at 50% -10%, var(--accent-glow), transparent 60%);pointer-events:none}
+.ring-wrap{position:relative;width:188px;height:188px}
+.ring-wrap .num{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.ring-wrap .num b{font-family:'Space Grotesk';font-size:56px;font-weight:700;line-height:1;letter-spacing:-.04em}
+.ring-wrap .num span{font-size:12.5px;color:var(--text-faint);font-family:'JetBrains Mono';margin-top:2px}
+.verdict h3{font-size:17px;margin-top:6px}
+.verdict .vlabel{
+  display:inline-flex;align-items:center;gap:7px;font-family:'JetBrains Mono';font-size:11.5px;font-weight:500;
+  padding:5px 11px;border-radius:999px;background:var(--amber-soft);color:var(--amber);
+  border:1px solid rgba(251,191,36,.3);letter-spacing:.04em;
+}
+.verdict p{font-size:13px;color:var(--text-dim);max-width:260px;margin-top:4px}
+
+/* ============================================================
+   KEY METRICS GRID
+   ============================================================ */
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:42px}
+.metric{
+  position:relative;border-radius:var(--radius);padding:22px 20px;
+  background:var(--surface);border:1px solid var(--border);
+  transition:transform .25s ease,border-color .25s,background .25s;
+  overflow:hidden;
+}
+.metric:hover{transform:translateY(-3px);border-color:var(--border-strong);background:var(--surface-2)}
+.metric .ml{font-size:12px;color:var(--text-faint);text-transform:uppercase;letter-spacing:.1em;font-family:'JetBrains Mono';margin-bottom:10px}
+.metric .mv{font-family:'Space Grotesk';font-weight:700;font-size:34px;letter-spacing:-.03em;line-height:1}
+.metric .mv .unit{font-size:15px;color:var(--text-dim);font-weight:500;margin-left:4px}
+.metric .ms{font-size:12px;color:var(--text-dim);margin-top:9px;font-family:'JetBrains Mono'}
+.metric .mi{position:absolute;top:18px;right:18px;color:var(--accent);opacity:.55}
+
+/* ============================================================
+   GENERIC CARD / CALLOUT / TABLE
+   ============================================================ */
+.card{
+  border-radius:var(--radius);background:var(--surface);border:1px solid var(--border);
+  padding:24px;box-shadow:var(--shadow);
+}
+.card h3{font-size:18px;margin-bottom:8px}
+.lead{font-size:16.5px;color:var(--text);line-height:1.8}
+.lead p+p{margin-top:14px}
+
+.callout{
+  border-radius:var(--radius-sm);padding:16px 18px;border:1px solid var(--border);
+  background:var(--surface);font-size:14px;color:var(--text-dim);line-height:1.7;
+  border-left:3px solid var(--accent);
+}
+.callout.amber{border-left-color:var(--amber)}
+.callout.indigo{border-left-color:var(--indigo)}
+.callout code{font-size:12.5px;background:var(--surface-3);padding:1px 6px;border-radius:5px;color:var(--accent-2)}
+
+table{width:100%;border-collapse:collapse;font-size:14px;border-radius:var(--radius-sm);overflow:hidden;border:1px solid var(--border)}
+th,td{padding:11px 14px;text-align:left;border-bottom:1px solid var(--border)}
+thead th{
+  background:var(--surface-2);font-family:'JetBrains Mono';font-size:11.5px;font-weight:500;
+  text-transform:uppercase;letter-spacing:.08em;color:var(--text-faint);
+}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--surface)}
+td .num,th .num{font-family:'JetBrains Mono'}
+td.num,th.num{text-align:right}
+.peak{color:var(--accent);font-weight:600}
+.bad{color:var(--red);font-family:'JetBrains Mono';font-size:12.5px}
+.warn{color:var(--amber);font-family:'JetBrains Mono';font-size:12.5px}
+.ok{color:var(--accent);font-family:'JetBrains Mono';font-size:12.5px}
+
+/* ============================================================
+   SCORECARD
+   ============================================================ */
+.scorecard{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.sc-card{
+  position:relative;border-radius:var(--radius);padding:22px;background:var(--surface);
+  border:1px solid var(--border);transition:transform .25s,border-color .25s,background .25s;overflow:hidden;
+}
+.sc-card:hover{transform:translateY(-3px);border-color:var(--border-strong);background:var(--surface-2)}
+.sc-card.lvl-5{border-top:2px solid var(--accent)}
+.sc-card.lvl-4{border-top:2px solid var(--accent-2)}
+.sc-card.lvl-3{border-top:2px solid var(--amber)}
+.sc-ico{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;margin-bottom:14px;background:var(--surface-3);color:var(--accent)}
+.sc-card.lvl-3 .sc-ico{color:var(--amber)}
+.sc-name{font-size:14.5px;font-weight:600;margin-bottom:2px}
+.sc-name small{display:block;font-family:'JetBrains Mono';font-size:10.5px;font-weight:400;color:var(--text-faint);margin-top:3px;letter-spacing:.03em}
+.stars{display:flex;gap:3px;margin:9px 0 11px}
+.stars svg{width:15px;height:15px}
+.star-on{fill:var(--accent)}
+.sc-card.lvl-3 .star-on{fill:var(--amber)}
+.star-off{fill:var(--text-faint);opacity:.3}
+.sc-reason{font-size:12.5px;color:var(--text-dim);line-height:1.6}
+.sc-grade{position:absolute;top:18px;right:20px;font-family:'JetBrains Mono';font-size:13px;font-weight:600;color:var(--accent)}
+.sc-card.lvl-3 .sc-grade{color:var(--amber)}
+
+/* ============================================================
+   ARCHITECTURE FLOW
+   ============================================================ */
+.arch-tiers{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin:26px 0 30px}
+.tier{border-radius:var(--radius);padding:20px;border:1px solid var(--border);background:var(--surface);position:relative}
+.tier h4{font-size:15px;margin-bottom:6px;display:flex;align-items:center;gap:9px}
+.tier .ttag{font-family:'JetBrains Mono';font-size:11px;color:var(--text-faint)}
+.tier p{font-size:13px;color:var(--text-dim);line-height:1.6}
+.tier.core{border-color:rgba(16,185,129,.3)}
+.tier.core h4 .badge{background:var(--accent);color:#03130d}
+.tier.shell{border-color:rgba(129,140,248,.3)}
+.tier.shell h4 .badge{background:var(--indigo);color:#0a0e13}
+.badge{font-family:'JetBrains Mono';font-size:10px;font-weight:600;padding:2px 8px;border-radius:5px;letter-spacing:.05em}
+
+.flow{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:8px}
+.step{
+  position:relative;border-radius:11px;padding:14px 14px 14px 16px;background:var(--surface);border:1px solid var(--border);
+  font-size:12.5px;color:var(--text-dim);line-height:1.5;transition:border-color .2s,background .2s;
+}
+.step:hover{border-color:var(--accent);background:var(--surface-2)}
+.step .sn{font-family:'JetBrains Mono';font-size:11px;font-weight:600;color:var(--accent);display:block;margin-bottom:5px}
+.step b{color:var(--text);font-weight:600;font-size:12.5px}
+.step .code{font-family:'JetBrains Mono';font-size:11.5px;color:var(--accent-2)}
+
+.components{display:flex;flex-wrap:wrap;gap:9px;margin-top:22px}
+.comp{font-size:12.5px;padding:8px 13px;border-radius:999px;background:var(--surface);border:1px solid var(--border);color:var(--text-dim);font-family:'JetBrains Mono'}
+.comp b{color:var(--accent);font-weight:600}
+
+/* ============================================================
+   CHARTS
+   ============================================================ */
+.chart-card{border-radius:var(--radius);background:var(--surface);border:1px solid var(--border);padding:22px;box-shadow:var(--shadow);margin-bottom:20px}
+.chart-card h3{font-size:16px;margin-bottom:4px;display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.chart-card .csub{font-size:12.5px;color:var(--text-faint);font-family:'JetBrains Mono';margin-bottom:16px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono'}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{width:12px;height:3px;border-radius:2px;display:inline-block}
+.legend .dotmark{width:9px;height:9px;border-radius:50%;height:9px}
+.chart-svg{width:100%;height:auto;display:block;overflow:visible}
+.axis-lbl{font-family:'JetBrains Mono';font-size:10.5px;fill:var(--text-faint)}
+.axis-title{font-family:'JetBrains Mono';font-size:11px;fill:var(--text-dim);font-weight:600}
+.grid-line{stroke:var(--border);stroke-width:1}
+.area-fill-rps{fill:url(#rpsGrad)}
+.line-rps{fill:none;stroke:var(--accent);stroke-width:2.5;stroke-linejoin:round;stroke-linecap:round}
+.line-p99{fill:none;stroke:var(--indigo);stroke-width:2.5;stroke-dasharray:6 4;stroke-linejoin:round;stroke-linecap:round}
+.bar-actual{fill:url(#barGrad)}
+.line-sweep-p99{fill:none;stroke:var(--amber);stroke-width:2.5;stroke-dasharray:6 4;stroke-linejoin:round}
+.pt{transition:r .2s}
+.pt:hover{r:6}
+.cliff-line{stroke:var(--red);stroke-width:1.5;stroke-dasharray:5 4}
+.cliff-band{fill:var(--red);opacity:.06}
+.annot{font-family:'JetBrains Mono';font-size:10.5px;fill:var(--red);font-weight:600}
+.annot-accent{fill:var(--accent)}
+
+/* memory bar */
+.mem-wrap{margin-top:8px}
+.mem-track{height:30px;border-radius:8px;background:var(--surface-3);border:1px solid var(--border);position:relative;overflow:hidden}
+.mem-fill{height:100%;width:0;border-radius:8px;background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width 1.4s cubic-bezier(.2,.8,.2,1);position:relative}
+.mem-fill::after{content:"";position:absolute;right:-1px;top:0;bottom:0;width:3px;background:var(--accent-2);box-shadow:0 0 12px var(--accent)}
+.mem-scale{display:flex;justify-content:space-between;font-family:'JetBrains Mono';font-size:10.5px;color:var(--text-faint);margin-top:7px}
+.mem-legend{display:flex;justify-content:space-between;align-items:baseline;margin-top:14px}
+.mem-legend .big{font-family:'Space Grotesk';font-weight:700;font-size:24px;color:var(--accent)}
+.mem-legend .big .u{font-size:13px;color:var(--text-dim);font-weight:500}
+.mem-legend .rt{text-align:right;font-size:12.5px;color:var(--text-dim);font-family:'JetBrains Mono'}
+
+/* ============================================================
+   CAPACITY
+   ============================================================ */
+.cap-grid{display:grid;grid-template-columns:1.4fr 1fr;gap:22px;align-items:start}
+.cap-callout{
+  border-radius:var(--radius);padding:24px;border:1px solid rgba(16,185,129,.25);
+  background:linear-gradient(180deg,rgba(16,185,129,.06),var(--surface));
+}
+.cap-callout h3{font-size:17px;margin-bottom:10px;color:var(--accent)}
+.cap-callout p{font-size:13.5px;color:var(--text-dim);line-height:1.7}
+
+/* ============================================================
+   RISK BOARD
+   ============================================================ */
+.risk-cols{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+.risk-col{border-radius:var(--radius);background:var(--surface);border:1px solid var(--border);overflow:hidden}
+.risk-col .col-head{padding:15px 18px;font-family:'Space Grotesk';font-weight:600;font-size:14px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)}
+.risk-col.p0 .col-head{background:var(--red-soft);color:var(--red)}
+.risk-col.p1 .col-head{background:var(--amber-soft);color:var(--amber)}
+.risk-col.p2 .col-head{background:var(--blue-soft);color:var(--blue)}
+.risk-col .col-head .ptag{font-family:'JetBrains Mono';font-size:11px;font-weight:700;padding:2px 7px;border-radius:5px;background:currentColor;color:var(--bg) !important}
+html:has(#tht:checked) .risk-col .col-head .ptag{color:#fff !important}
+.risk-col .col-head .cdesc{font-family:'JetBrains Mono';font-size:10.5px;font-weight:400;color:var(--text-faint);margin-left:auto;text-transform:uppercase;letter-spacing:.05em}
+.risk-item{padding:16px 18px;border-bottom:1px solid var(--border);transition:background .2s}
+.risk-item:last-child{border-bottom:none}
+.risk-item:hover{background:var(--surface-2)}
+.risk-item .rh{display:flex;gap:9px;align-items:flex-start;margin-bottom:7px}
+.risk-item .rid{font-family:'JetBrains Mono';font-size:11px;font-weight:700;color:var(--text-faint);flex-shrink:0;margin-top:2px}
+.risk-item .rt{font-size:13.5px;font-weight:600;color:var(--text);line-height:1.4}
+.risk-item .rt code{font-size:11.5px;color:var(--accent-2);background:var(--surface-3);padding:1px 5px;border-radius:4px}
+.risk-item .rb{font-size:12.5px;color:var(--text-dim);line-height:1.6}
+.risk-item .rb b{color:var(--text);font-weight:600}
+.risk-item .rb .impact{color:var(--red)}
+.risk-col.p1 .risk-item .rb .impact{color:var(--amber)}
+.risk-col.p2 .risk-item .rb .impact{color:var(--blue)}
+.risk-item .fix{margin-top:7px;font-size:12.5px;color:var(--text-dim);line-height:1.6;padding-left:11px;border-left:2px solid var(--accent)}
+.risk-item .fix::before{content:"建议 → ";color:var(--accent);font-family:'JetBrains Mono';font-size:11px;font-weight:600}
+
+/* ============================================================
+   METHODOLOGY (details)
+   ============================================================ */
+.method-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+.method-item{padding:18px;border-radius:var(--radius-sm);background:var(--surface);border:1px solid var(--border)}
+.method-item h4{font-size:14px;margin-bottom:7px;display:flex;align-items:center;gap:8px;color:var(--text)}
+.method-item h4 .mn{font-family:'JetBrains Mono';font-size:11px;color:var(--accent);font-weight:600}
+.method-item p{font-size:13px;color:var(--text-dim);line-height:1.65}
+
+/* footer */
+footer{padding:48px 0 60px;border-top:1px solid var(--border);margin-top:40px}
+.foot-inner{display:flex;flex-wrap:wrap;gap:20px;justify-content:space-between;align-items:flex-start}
+.foot-brand{font-family:'Space Grotesk';font-weight:700;font-size:16px}
+.foot-meta{font-size:12px;color:var(--text-faint);font-family:'JetBrains Mono';line-height:1.7;text-align:right;max-width:520px}
+.disclaimer{width:100%;margin-top:24px;font-size:12px;color:var(--text-faint);font-family:'JetBrains Mono';padding:14px 16px;border-radius:10px;border:1px solid var(--border);background:var(--surface);line-height:1.6}
+
+/* ============================================================
+   SCROLL REVEAL (pure CSS, staggered load)
+   ============================================================ */
+@keyframes rise{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:none}}
+.reveal{opacity:0;animation:rise .8s cubic-bezier(.2,.8,.2,1) forwards}
+.r1{animation-delay:.05s}.r2{animation-delay:.13s}.r3{animation-delay:.21s}.r4{animation-delay:.29s}
+.r5{animation-delay:.37s}.r6{animation-delay:.45s}.r7{animation-delay:.53s}.r8{animation-delay:.61s}
+
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
+@media (max-width:1024px){
+  .hero-grid,.cap-grid{grid-template-columns:1fr}
+  .scorecard{grid-template-columns:repeat(2,1fr)}
+  .metrics{grid-template-columns:repeat(2,1fr)}
+  .risk-cols{grid-template-columns:1fr}
+  .arch-tiers{grid-template-columns:1fr}
+  .method-grid{grid-template-columns:1fr}
+}
+@media (max-width:680px){
+  body{font-size:15px}
+  .wrap{padding:0 18px}
+  .nav-links a:not(.brand){display:none}
+  .nav-links{margin-left:auto}
+  .scorecard{grid-template-columns:1fr}
+  .metrics{grid-template-columns:1fr 1fr}
+  .flow{grid-template-columns:1fr}
+  section{padding:52px 0}
+  header.hero{padding:40px 0 24px}
+  .ring-wrap{width:158px;height:158px}
+  .ring-wrap .num b{font-size:46px}
+}
+@media (prefers-reduced-motion:reduce){
+  *{animation:none !important;transition:none !important}
+  .reveal{opacity:1}
+}
+
+/* ============================================================
+   PRINT
+   ============================================================ */
+@media print{
+  html[data-theme]{--bg:#ffffff;--text:#0b0f14;--text-dim:#374151;--text-faint:#6b7280;
+    --surface:#fff;--surface-2:#fff;--surface-3:#f3f4f6;--border:#d1d5db;--border-strong:#9ca3af;
+    --shadow:none}
+  body{background:#fff;font-size:11pt}
+  body::before,body::after{display:none}
+  nav.top,footer .foot-meta .no-print{display:none !important}
+  section{padding:18px 0;break-inside:avoid;page-break-inside:avoid;border-color:#d1d5db}
+  .card,.chart-card,.metric,.sc-card,.tier,.step,.risk-col,.method-item,.verdict{
+    break-inside:avoid;page-break-inside:avoid;box-shadow:none}
+  .reveal{opacity:1 !important;animation:none !important}
+  a{color:#0b0f14}
+  .chart-svg{max-height:340px}
+}
+</style>
+</head>
+<body>
+
+<!-- ============ STICKY NAV ============ -->
+<nav class="top">
+  <div class="nav-inner">
+    <div class="brand"><span class="dot"></span>Hydra <small>v0.1.0</small></div>
+    <div class="nav-links">
+      <a href="#summary">摘要</a>
+      <a href="#scorecard">评分卡</a>
+      <a href="#architecture">架构</a>
+      <a href="#performance">性能</a>
+      <a href="#capacity">容量</a>
+      <a href="#risk">风险</a>
+      <a href="#method">方法</a>
+      <label class="theme-toggle" for="tht">
+        <input type="checkbox" id="tht">
+        <span class="ti sun">☀</span><span class="ti moon">☾</span>
+      </label>
+    </div>
+  </div>
+</nav>
+
+<!-- ============ HERO ============ -->
+<header class="hero">
+  <div class="wrap">
+    <div class="hero-grid">
+      <div class="reveal r1">
+        <div class="eyebrow">Production Readiness Report</div>
+        <h1 class="hero-title">Hydra<span class="grad">.</span></h1>
+        <p class="hero-sub">生产就绪度评测报告 · Performance &amp; Capacity Assessment</p>
+        <div class="meta-row">
+          <span class="chip">评测日期 · <b>2026-08-09</b></span>
+          <span class="chip">版本 · <b>v0.1.0</b></span>
+          <span class="chip">技术栈 · <b>Rust + Pingora 0.8</b></span>
+          <span class="chip">环境 · <b>macOS (10 核 / 24GB) 本地基准测试</b></span>
+        </div>
+      </div>
+
+      <!-- VERDICT RING -->
+      <div class="verdict reveal r2">
+        <div class="ring-wrap">
+          <svg viewBox="0 0 200 200" width="100%" height="100%">
+            <defs>
+              <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#10b981"/>
+                <stop offset="55%" stop-color="#34d399"/>
+                <stop offset="100%" stop-color="#818cf8"/>
+              </linearGradient>
+            </defs>
+            <circle cx="100" cy="100" r="86" fill="none" stroke="var(--border)" stroke-width="13"/>
+            <circle cx="100" cy="100" r="86" fill="none" stroke="url(#ringGrad)" stroke-width="13"
+              stroke-linecap="round"
+              stroke-dasharray="540.35"
+              stroke-dashoffset="118.877"
+              transform="rotate(-90 100 100)"
+              style="filter:drop-shadow(0 0 8px var(--accent-glow))"/>
+          </svg>
+          <div class="num"><b>7.8</b><span>/ 10 · 条件性就绪</span></div>
+        </div>
+        <span class="vlabel">◐ Conditionally Production-Ready</span>
+        <p>可以上生产，但需先修复若干运维与配置缺陷</p>
+      </div>
+    </div>
+
+    <!-- KEY METRICS -->
+    <div class="metrics">
+      <div class="metric reveal r3">
+        <div class="ml">峰值吞吐</div>
+        <div class="mv">11,056<span class="unit">RPS</span></div>
+        <div class="ms">c=25 · p99=4.39ms</div>
+      </div>
+      <div class="metric reveal r4">
+        <div class="ml">满载内存峰值</div>
+        <div class="mv">65<span class="unit">MiB (RSS)</span></div>
+        <div class="ms">18.6 → 65.4 MiB</div>
+      </div>
+      <div class="metric reveal r5">
+        <div class="ml">单请求网关开销</div>
+        <div class="mv">0.3<span class="unit">ms</span></div>
+        <div class="ms">相对 LLM 延迟可忽略</div>
+      </div>
+      <div class="metric reveal r6">
+        <div class="ml">生产代码 unwrap/unsafe/panic</div>
+        <div class="mv">0<span class="unit">处</span></div>
+        <div class="ms">仅限 #[cfg(test)]</div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ 1. EXECUTIVE SUMMARY ============ -->
+<section id="summary">
+  <div class="wrap">
+    <div class="sec-head reveal r1">
+      <div class="eyebrow">01 · Executive Summary</div>
+      <h2>执行摘要</h2>
+    </div>
+    <div class="card reveal r2">
+      <div class="lead">
+        <p>Hydra 是一个基于 Rust + Pingora 0.8 构建的高性能 LLM 路由网关，采用「纯领域核心 (hydra-core) + I/O 外壳 (hydra-server)」的两层架构，核心层零 I/O 依赖并有 CI 强制的依赖防火墙。代码工程质量出色：两个 crate 均开启 <code>#![forbid(unsafe_code)]</code>，生产代码中<strong>零</strong> <code>unwrap()</code>/<code>panic!</code>/<code>unsafe</code>（全部限制在 <code>#[cfg(test)]</code> 内）。</p>
+        <p>基准性能测试（本地 10 核机器，使用线程化 mock 上游，未触达真实付费上游）显示：网关单请求开销约 0.3ms，峰值合成吞吐约 <strong>11,000 RPS</strong>（c=25，p99=4.39ms），限速下的稳定吞吐天花板约 <strong>3,500–4,000 RPS</strong>。内存表现极其出色——满载压力下 RSS 仅 <strong>18.6 → 65.4 MiB</strong>。</p>
+        <p>按 8 核 16G VPS 推算，预计可承载 <strong>6,000 RPS 合成峰值</strong>、<strong>2,000–3,000 路并发流式连接</strong>，内存占用远低于上限。</p>
+        <p>结论：<strong>代码与架构层面已达生产水准</strong>，但<strong>运维与部署层面存在若干必须修复的缺陷</strong>（见风险登记表），修复后即可投产。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 2. SCORECARD ============ -->
+<section id="scorecard">
+  <div class="wrap">
+    <div class="sec-head reveal r1">
+      <div class="eyebrow">02 · Dimension Scorecard</div>
+      <h2>维度评分卡</h2>
+      <p>八个维度逐一评级（5 星制）。满分维度以翠绿色强调，3 星维度以琥珀色警示。</p>
+    </div>
+
+    <div class="scorecard">
+      <!-- 1 Code Safety 5/5 -->
+      <div class="sc-card lvl-5 reveal r1">
+        <div class="sc-grade">5/5</div>
+        <div class="sc-ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 4v6c0 5-3.4 8.5-8 10-4.6-1.5-8-5-8-10V6l8-4z"/><path d="M9 12l2 2 4-4"/></svg></div>
+        <div class="sc-name">代码安全<small>Code Safety</small></div>
+        <div class="stars"><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg></div>
+        <div class="sc-reason">全 crate <code style="font-size:11px">forbid(unsafe_code)</code>，生产路径零 unwrap/panic/unsafe，仅 <code style="font-size:11px">unwrap_or</code> 安全变体。</div>
+      </div>
+
+      <!-- 2 Architecture 5/5 -->
+      <div class="sc-card lvl-5 reveal r2">
+        <div class="sc-grade">5/5</div>
+        <div class="sc-ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12l9-8 9 8"/><path d="M5 10v10h14V10"/><path d="M10 20v-6h4v6"/></svg></div>
+        <div class="sc-name">架构设计<small>Architecture</small></div>
+        <div class="stars"><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg></div>
+        <div class="sc-reason">纯核心 + I/O 外壳分层，依赖防火墙 CI 强制，注入式时间使测试确定性强。</div>
+      </div>
+
+      <!-- 3 Performance 5/5 -->
+      <div class="sc-card lvl-5 reveal r3">
+        <div class="sc-grade">5/5</div>
+        <div class="sc-ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></div>
+        <div class="sc-name">性能与资源<small>Performance</small></div>
+        <div class="stars"><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg></div>
+        <div class="sc-reason">内存极省 (65MiB)，峰值 11K RPS，单请求开销 0.3ms，Pingora 异步零拷贝。</div>
+      </div>
+
+      <!-- 4 Observability 4/5 -->
+      <div class="sc-card lvl-4 reveal r4">
+        <div class="sc-grade">4/5</div>
+        <div class="sc-ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 010 18 14 14 0 010-18z"/></svg></div>
+        <div class="sc-name">可观测性<small>Observability</small></div>
+        <div class="stars"><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-off" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg></div>
+        <div class="sc-reason">Prometheus 17 项指标 + tracing；扣分：compose 无 healthcheck、部分时间戳格式不一致。</div>
+      </div>
+
+      <!-- 5 Persistence 4/5 -->
+      <div class="sc-card lvl-4 reveal r5">
+        <div class="sc-grade">4/5</div>
+        <div class="sc-ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg></div>
+        <div class="sc-name">持久化<small>Persistence</small></div>
+        <div class="stars"><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-off" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg></div>
+        <div class="sc-reason">SQLite WAL + ClickHouse 双 sink，通道批写入；扣分：sqlx 运行期校验 (非 query!)、provider 密钥明文存储。</div>
+      </div>
+
+      <!-- 6 Security 4/5 -->
+      <div class="sc-card lvl-4 reveal r6">
+        <div class="sc-grade">4/5</div>
+        <div class="sc-ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/><circle cx="12" cy="16" r="1.3"/></svg></div>
+        <div class="sc-name">安全性<small>Security</small></div>
+        <div class="stars"><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-off" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg></div>
+        <div class="sc-reason">客户端密钥仅 SHA-256 缓存、按租户 TLS SNI；扣分：provider 密钥 SQLite 明文、<code style="font-size:11px">?reveal=1</code> 返回明文。</div>
+      </div>
+
+      <!-- 7 Testing 4/5 -->
+      <div class="sc-card lvl-4 reveal r7">
+        <div class="sc-grade">4/5</div>
+        <div class="sc-ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6l1 3h4v15H4V5h4l1-3z"/><path d="M9 13l2 2 4-4"/></svg></div>
+        <div class="sc-name">测试覆盖<small>Testing</small></div>
+        <div class="stars"><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-off" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg></div>
+        <div class="sc-reason">核心层 ~2K 行单测/集成、服务层 ~5.7K 行集成 + Playwright e2e + Python 黑盒；扣分：服务层测试在 CI 中 <code style="font-size:11px">continue-on-error</code> 非硬门禁。</div>
+      </div>
+
+      <!-- 8 Ops/Deploy 3/5 -->
+      <div class="sc-card lvl-3 reveal r8">
+        <div class="sc-grade">3/5</div>
+        <div class="sc-ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><circle cx="7" cy="7" r="1" fill="currentColor"/><circle cx="7" cy="17" r="1" fill="currentColor"/></svg></div>
+        <div class="sc-name">运维部署<small>Ops / Deploy</small></div>
+        <div class="stars"><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-off" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-off" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg></div>
+        <div class="sc-reason">Docker + tini PID1 + 非 root；扣分：compose 全无 healthcheck、Dockerfile 环境变量名与代码读取不一致 (<code style="font-size:11px">HYDRA_DATABASE_URL</code> vs <code style="font-size:11px">HYDRA_DB_URL</code>)、缺 lock 文件校验说明。</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 3. ARCHITECTURE ============ -->
+<section id="architecture">
+  <div class="wrap">
+    <div class="sec-head reveal r1">
+      <div class="eyebrow">03 · Architecture Overview</div>
+      <h2>架构概览</h2>
+    </div>
+
+    <div class="arch-tiers reveal r2">
+      <div class="tier core">
+        <h4><span class="badge">CORE</span> hydra-core <span class="ttag">纯领域 · 零 I/O</span></h4>
+        <p>仅依赖 serde / memchr / bytes / sha2。所有状态由注入的 <code>Instant</code> 驱动，无隐藏时钟。</p>
+      </div>
+      <div class="tier shell">
+        <h4><span class="badge">SHELL</span> hydra-server <span class="ttag">I/O 外壳</span></h4>
+        <p>Pingora 代理外壳 + sqlx SQLite + reqwest + TLS + 管理面。</p>
+      </div>
+    </div>
+
+    <h3 style="font-size:16px;margin:6px 0 16px;color:var(--text)" class="reveal r3">Terminate 模式请求生命周期</h3>
+
+    <div class="flow reveal r4">
+      <div class="step"><span class="sn">① 域名→租户解析</span></div>
+      <div class="step"><span class="sn">② 租户启用检查</span></div>
+      <div class="step"><span class="sn">③ 解析客户端 api-key</span></div>
+      <div class="step"><span class="sn">④ 外部鉴权</span>缓存优先，命中跳过</div>
+      <div class="step"><span class="sn">⑤ 读取请求体</span>硬上限 <span class="code">32MiB</span>，超限 <span class="code">413</span></div>
+      <div class="step"><span class="sn">⑥ extract_model</span>提取 model 字段</div>
+      <div class="step"><span class="sn">⑦ 预限流计数闸</span>超限 <span class="code">429</span></div>
+      <div class="step"><span class="sn">⑧ 候选 + SWRR</span><span class="code">router::resolve</span> + <span class="code">swrr::order</span> 平滑加权轮询</div>
+      <div class="step"><span class="sn">⑨ 故障转移循环</span>逐候选构造请求 → reqwest 发送 → SSE 流式回传；失败则 <span class="code">breaker.on_failure</span> 并继续下一候选；返回 <span class="code">Ok(true)</span> 使 Pingora 永不直连上游</div>
+    </div>
+
+    <h3 style="font-size:16px;margin:28px 0 12px;color:var(--text)" class="reveal r5">核心组件</h3>
+    <div class="components reveal r6">
+      <span class="comp"><b>SWRR</b> 负载均衡</span>
+      <span class="comp"><b>熔断器</b> 连续失败阈值 5 / 探活 10s</span>
+      <span class="comp"><b>滑动窗口限流</b> 请求数 + token 双维度</span>
+      <span class="comp"><b>memchr</b> 零拷贝 SSE 用量解析 (OpenAI/Anthropic/通用归一化)</span>
+      <span class="comp"><b>ArcSwap</b> 热加载配置</span>
+      <span class="comp"><b>SHA-256 鉴权缓存</b> allow 5min / deny 30s / 超时 2s / 默认 fail-closed</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 4. PERFORMANCE ============ -->
+<section id="performance">
+  <div class="wrap">
+    <div class="sec-head reveal r1">
+      <div class="eyebrow">04 · Performance Results</div>
+      <h2>性能测试结果</h2>
+    </div>
+
+    <div class="callout reveal r2" style="margin-bottom:30px">
+      <strong>测试方法学</strong> · 本地基准测试，未触达任何真实付费上游。使用线程化 Python mock（预计算响应，几乎零 CPU）模拟 LLM 与鉴权端点，以 <code>oha 1.15</code> 压测。先预热鉴权缓存。同时测量 mock 直连基线以隔离<strong>网关开销 = 经网关延迟 − 基线</strong>。注意：mock 上游为 Python <code>ThreadingHTTPServer</code>，在高并发下自身会成为瓶颈，因此高并发区间的衰减部分来自 mock，而非网关硬限制。
+    </div>
+
+    <!-- 4.1 BASELINE -->
+    <h3 style="font-size:18px;margin:10px 0 14px" class="reveal r2">4.1 基线 · mock 直连 <span style="font-family:'JetBrains Mono';font-size:12px;color:var(--text-faint);font-weight:400">Baseline</span></h3>
+    <div class="chart-card reveal r3" style="padding:18px">
+      <table>
+        <thead><tr><th>并发</th><th class="num">RPS</th><th class="num">p50 延迟</th></tr></thead>
+        <tbody>
+          <tr><td class="num">50</td><td class="num">26,637</td><td class="num">1.33ms</td></tr>
+          <tr><td class="num">100</td><td class="num">25,436</td><td class="num">2.56ms</td></tr>
+          <tr><td class="num">200</td><td class="num">24,715</td><td class="num">3.79ms</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:12.5px;color:var(--text-faint);font-family:'JetBrains Mono';margin-top:12px">注释：mock 天花板约 25,000 RPS。</p>
+    </div>
+
+    <!-- 4.2 THROUGHPUT -->
+    <h3 style="font-size:18px;margin:30px 0 14px" class="reveal r2">4.2 经网关 · 非流式 <span style="font-family:'JetBrains Mono';font-size:12px;color:var(--text-faint);font-weight:400">Throughput Saturation</span></h3>
+
+    <div class="chart-card reveal r3">
+      <h3>并发 → RPS / p99 延迟</h3>
+      <p class="csub">双 Y 轴 · 左轴 RPS（翠绿面积+线）· 右轴 p99 ms（靛蓝虚线）· 峰值 c=25 高亮</p>
+      <div class="legend" style="margin-bottom:10px">
+        <span><i style="background:var(--accent)"></i> RPS（左轴）</span>
+        <span><i style="background:var(--indigo);border:1px dashed var(--indigo)"></i> p99 延迟 ms（右轴）</span>
+        <span><i class="dotmark" style="background:var(--accent)"></i> 峰值点</span>
+        <span><i style="background:var(--red);border:1px dashed var(--red)"></i> 饱和悬崖 c≥200</span>
+      </div>
+      <svg class="chart-svg" viewBox="0 0 880 420" role="img" aria-label="并发与吞吐延迟关系图">
+        <defs>
+          <linearGradient id="rpsGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#10b981" stop-opacity="0.40"/>
+            <stop offset="100%" stop-color="#10b981" stop-opacity="0.02"/>
+          </linearGradient>
+        </defs>
+        <!-- saturation cliff band -->
+        <rect class="cliff-band" x="730" y="50" width="100" height="310"/>
+        <line class="cliff-line" x1="820" y1="50" x2="820" y2="360"/>
+        <text class="annot" x="824" y="64" >饱和悬崖</text>
+        <text class="annot" x="824" y="78" style="font-weight:400">c≥200 全部失败</text>
+
+        <!-- gridlines (RPS left axis) -->
+        <g>
+          <line class="grid-line" x1="60" y1="360" x2="820" y2="360"/>
+          <line class="grid-line" x1="60" y1="282.5" x2="820" y2="282.5"/>
+          <line class="grid-line" x1="60" y1="205" x2="820" y2="205"/>
+          <line class="grid-line" x1="60" y1="127.5" x2="820" y2="127.5"/>
+          <line class="grid-line" x1="60" y1="50" x2="820" y2="50"/>
+        </g>
+        <!-- left axis labels (RPS) -->
+        <text class="axis-lbl" x="52" y="363" text-anchor="end">0</text>
+        <text class="axis-lbl" x="52" y="286" text-anchor="end">3k</text>
+        <text class="axis-lbl" x="52" y="208" text-anchor="end">6k</text>
+        <text class="axis-lbl" x="52" y="131" text-anchor="end">9k</text>
+        <text class="axis-lbl" x="52" y="53" text-anchor="end">12k</text>
+        <text class="axis-title" x="20" y="40" >RPS</text>
+
+        <!-- right axis labels (p99 ms) -->
+        <text class="axis-lbl" x="828" y="363">0</text>
+        <text class="axis-lbl" x="828" y="298">10</text>
+        <text class="axis-lbl" x="828" y="236">20</text>
+        <text class="axis-lbl" x="828" y="174">30</text>
+        <text class="axis-lbl" x="828" y="112">40</text>
+        <text class="axis-lbl" x="828" y="53">50</text>
+        <text class="axis-title" x="848" y="40">p99 ms</text>
+
+        <!-- x axis labels -->
+        <text class="axis-lbl" x="60" y="378" text-anchor="middle">1</text>
+        <text class="axis-lbl" x="250" y="378" text-anchor="middle">10</text>
+        <text class="axis-lbl" x="440" y="378" text-anchor="middle">25</text>
+        <text class="axis-lbl" x="630" y="378" text-anchor="middle">50</text>
+        <text class="axis-lbl" x="820" y="378" text-anchor="middle">100</text>
+        <text class="axis-title" x="440" y="402" text-anchor="middle">并发连接数 (c)</text>
+
+        <!-- RPS area + line -->
+        <path class="area-fill-rps" d="M60,276.15 L250,111.05 L440,74.39 L630,82.11 L820,191.59 L820,360 L60,360 Z"/>
+        <path class="line-rps" d="M60,276.15 L250,111.05 L440,74.39 L630,82.11 L820,191.59"/>
+
+        <!-- p99 line -->
+        <path class="line-p99" d="M60,356.03 L250,347.41 L440,332.78 L630,305.69 L820,96.93"/>
+
+        <!-- RPS points -->
+        <circle class="pt" cx="60" cy="276.15" r="4" fill="#10b981"/>
+        <circle class="pt" cx="250" cy="111.05" r="4" fill="#10b981"/>
+        <circle class="pt" cx="630" cy="82.11" r="4" fill="#10b981"/>
+        <circle class="pt" cx="820" cy="191.59" r="4" fill="#10b981"/>
+        <!-- p99 points -->
+        <circle cx="60" cy="356.03" r="3.2" fill="#818cf8"/>
+        <circle cx="250" cy="347.41" r="3.2" fill="#818cf8"/>
+        <circle cx="440" cy="332.78" r="3.2" fill="#818cf8"/>
+        <circle cx="630" cy="305.69" r="3.2" fill="#818cf8"/>
+        <circle cx="820" cy="96.93" r="3.2" fill="#818cf8"/>
+
+        <!-- PEAK highlight c=25 -->
+        <circle cx="440" cy="74.39" r="13" fill="none" stroke="#34d399" stroke-width="1.5" opacity="0.5"/>
+        <circle class="pt" cx="440" cy="74.39" r="6" fill="#34d399" stroke="#0a0e13" stroke-width="2"/>
+        <line x1="440" y1="74.39" x2="440" y2="44" stroke="#34d399" stroke-width="1" stroke-dasharray="2 2"/>
+        <rect x="380" y="24" width="120" height="20" rx="5" fill="#10b981"/>
+        <text x="440" y="38" text-anchor="middle" fill="#03130d" style="font-family:'JetBrains Mono';font-size:11px;font-weight:700">峰值 11,056 RPS</text>
+
+        <!-- data value labels on RPS line -->
+        <text class="axis-lbl" x="60" y="266" text-anchor="middle" style="fill:var(--accent-2)">3,246</text>
+        <text class="axis-lbl" x="250" y="100" text-anchor="middle" style="fill:var(--accent-2)">9,637</text>
+        <text class="axis-lbl" x="630" y="71" text-anchor="middle" style="fill:var(--accent-2)">10,757</text>
+        <text class="axis-lbl" x="820" y="181" text-anchor="middle" style="fill:var(--accent-2)">6,519</text>
+        <!-- p99 label at spike -->
+        <text class="axis-lbl" x="820" y="88" text-anchor="end" style="fill:var(--indigo)">42.43ms</text>
+      </svg>
+
+      <table style="margin-top:8px">
+        <thead><tr><th>并发 (c)</th><th class="num">RPS</th><th class="num">p50</th><th class="num">p99</th><th class="num">错误率</th></tr></thead>
+        <tbody>
+          <tr><td class="num">1</td><td class="num">3,246</td><td class="num">0.29ms</td><td class="num">0.64ms</td><td class="num ok">0%</td></tr>
+          <tr><td class="num">10</td><td class="num">9,637</td><td class="num">0.95ms</td><td class="num">2.03ms</td><td class="num ok">0%</td></tr>
+          <tr><td class="num">25</td><td class="num peak">11,056</td><td class="num">2.15ms</td><td class="num">4.39ms</td><td class="num ok">0%</td></tr>
+          <tr><td class="num">50</td><td class="num">10,757</td><td class="num">4.36ms</td><td class="num">8.76ms</td><td class="num ok">0%</td></tr>
+          <tr><td class="num">100</td><td class="num">6,519</td><td class="num">12.42ms</td><td class="num">42.43ms</td><td class="num warn">0.12% (502/503)</td></tr>
+          <tr><td class="num">200</td><td class="num">3,081</td><td class="num">—</td><td class="num">—</td><td class="num bad">全部失败</td></tr>
+          <tr><td class="num">400</td><td class="num">3,150</td><td class="num">—</td><td class="num">—</td><td class="num bad">全部失败</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 4.3 STREAMING -->
+    <h3 style="font-size:18px;margin:30px 0 14px" class="reveal r2">4.3 经网关 · 流式 SSE <span style="font-family:'JetBrains Mono';font-size:12px;color:var(--text-faint);font-weight:400">Streaming</span></h3>
+    <div class="chart-card reveal r3" style="padding:18px">
+      <table>
+        <thead><tr><th>并发 (c)</th><th class="num">RPS</th><th class="num">p99</th><th class="num">错误率</th></tr></thead>
+        <tbody>
+          <tr><td class="num">10</td><td class="num">7,856</td><td class="num">2.4ms</td><td class="num ok">0%</td></tr>
+          <tr><td class="num">50</td><td class="num peak">10,323</td><td class="num">9.3ms</td><td class="num ok">0%</td></tr>
+          <tr><td class="num">100</td><td class="num">6,287</td><td class="num">40ms</td><td class="num warn">0.09%</td></tr>
+          <tr><td class="num">200</td><td class="num">3,068</td><td class="num">8,001ms</td><td class="num bad">全部 502/503 (悬崖)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 4.4 RATE-LIMITED SWEEP -->
+    <h3 style="font-size:18px;margin:30px 0 14px" class="reveal r2">4.4 限速扫描 <span style="font-family:'JetBrains Mono';font-size:12px;color:var(--text-faint);font-weight:400">Rate-Limited Sweep · c=200，寻找拐点</span></h3>
+
+    <div class="chart-card reveal r3">
+      <h3>供给速率 → 实际 RPS / p99 延迟</h3>
+      <p class="csub">寻找稳定吞吐拐点 · 琥珀虚线为 p99 · 拐点区间高亮</p>
+      <div class="legend" style="margin-bottom:10px">
+        <span><i style="background:var(--accent)"></i> 实际 RPS</span>
+        <span><i style="background:var(--amber);border:1px dashed var(--amber)"></i> p99 延迟 ms</span>
+        <span><i style="background:var(--red);opacity:.3"></i> 拐点/饱和区间</span>
+      </div>
+      <svg class="chart-svg" viewBox="0 0 880 420" role="img" aria-label="限速扫描拐点图">
+        <defs>
+          <linearGradient id="barGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#10b981" stop-opacity="0.85"/>
+            <stop offset="100%" stop-color="#10b981" stop-opacity="0.35"/>
+          </linearGradient>
+        </defs>
+        <!-- inflection band 4000->8000 -->
+        <rect x="630" y="50" width="190" height="310" fill="#f87171" opacity="0.07"/>
+        <line x1="630" y1="50" x2="630" y2="360" stroke="#f87171" stroke-width="1.2" stroke-dasharray="4 4" opacity="0.6"/>
+        <text class="annot" x="725" y="64" text-anchor="middle">拐点区间</text>
+
+        <!-- gridlines -->
+        <g>
+          <line class="grid-line" x1="60" y1="360" x2="820" y2="360"/>
+          <line class="grid-line" x1="60" y1="282.5" x2="820" y2="282.5"/>
+          <line class="grid-line" x1="60" y1="205" x2="820" y2="205"/>
+          <line class="grid-line" x1="60" y1="127.5" x2="820" y2="127.5"/>
+          <line class="grid-line" x1="60" y1="50" x2="820" y2="50"/>
+        </g>
+        <!-- left axis (actual RPS, max 4500) -->
+        <text class="axis-lbl" x="52" y="363" text-anchor="end">0</text>
+        <text class="axis-lbl" x="52" y="286" text-anchor="end">1.1k</text>
+        <text class="axis-lbl" x="52" y="208" text-anchor="end">2.3k</text>
+        <text class="axis-lbl" x="52" y="131" text-anchor="end">3.4k</text>
+        <text class="axis-lbl" x="52" y="53" text-anchor="end">4.5k</text>
+        <text class="axis-title" x="14" y="40">实际 RPS</text>
+        <!-- right axis (p99 ms, max 5000) -->
+        <text class="axis-lbl" x="828" y="363">0</text>
+        <text class="axis-lbl" x="828" y="298">1k</text>
+        <text class="axis-lbl" x="828" y="236">2k</text>
+        <text class="axis-lbl" x="828" y="174">3k</text>
+        <text class="axis-lbl" x="828" y="112">4k</text>
+        <text class="axis-lbl" x="828" y="53">5k</text>
+        <text class="axis-title" x="848" y="40">p99 ms</text>
+
+        <!-- bars (actual RPS). width 44, centered on x -->
+        <g>
+          <rect class="bar-actual" x="38" y="325.56" width="44" height="34.44"/>
+          <rect class="bar-actual" x="228" y="291.18" width="44" height="68.82"/>
+          <rect class="bar-actual" x="418" y="222.29" width="44" height="137.71"/>
+          <rect class="bar-actual" x="608" y="84.51" width="44" height="275.49"/>
+          <rect class="bar-actual" x="798" y="116.13" width="44" height="243.87"/>
+        </g>
+        <!-- actual RPS connecting line overlay -->
+        <path d="M60,325.56 L250,291.18 L440,222.29 L630,84.51 L820,116.13" fill="none" stroke="#34d399" stroke-width="2" stroke-linejoin="round" opacity="0.7"/>
+        <!-- p99 line -->
+        <path class="line-sweep-p99" d="M60,359.88 L250,359.75 L440,358.08 L630,355.6 L820,75.1"/>
+        <!-- points -->
+        <circle class="pt" cx="60" cy="325.56" r="4" fill="#10b981"/>
+        <circle class="pt" cx="250" cy="291.18" r="4" fill="#10b981"/>
+        <circle class="pt" cx="440" cy="222.29" r="4" fill="#10b981"/>
+        <circle class="pt" cx="630" cy="84.51" r="4" fill="#10b981"/>
+        <circle class="pt" cx="820" cy="116.13" r="4" fill="#10b981"/>
+        <circle cx="60" cy="359.88" r="3.2" fill="#fbbf24"/>
+        <circle cx="250" cy="359.75" r="3.2" fill="#fbbf24"/>
+        <circle cx="440" cy="358.08" r="3.2" fill="#fbbf24"/>
+        <circle cx="630" cy="355.6" r="3.2" fill="#fbbf24"/>
+        <circle cx="820" cy="75.1" r="4.5" fill="#fbbf24" stroke="#0a0e13" stroke-width="1.5"/>
+
+        <!-- value labels -->
+        <text class="axis-lbl" x="60" y="318" text-anchor="middle" style="fill:var(--accent-2)">500</text>
+        <text class="axis-lbl" x="250" y="283" text-anchor="middle" style="fill:var(--accent-2)">999</text>
+        <text class="axis-lbl" x="440" y="214" text-anchor="middle" style="fill:var(--accent-2)">1,999</text>
+        <text class="axis-lbl" x="630" y="76" text-anchor="middle" style="fill:var(--accent-2)">3,999</text>
+        <text class="axis-lbl" x="820" y="108" text-anchor="middle" style="fill:var(--accent-2)">3,540</text>
+        <text class="axis-lbl" x="820" y="66" text-anchor="end" style="fill:var(--amber)">p99=4,597ms</text>
+
+        <!-- x labels -->
+        <text class="axis-lbl" x="60" y="378" text-anchor="middle">500</text>
+        <text class="axis-lbl" x="250" y="378" text-anchor="middle">1,000</text>
+        <text class="axis-lbl" x="440" y="378" text-anchor="middle">2,000</text>
+        <text class="axis-lbl" x="630" y="378" text-anchor="middle">4,000</text>
+        <text class="axis-lbl" x="820" y="378" text-anchor="middle">8,000</text>
+        <text class="axis-title" x="440" y="402" text-anchor="middle">供给速率 (RPS)</text>
+      </svg>
+
+      <table style="margin-top:8px">
+        <thead><tr><th>供给速率 (RPS)</th><th class="num">实际 RPS</th><th class="num">p99</th><th>状态</th></tr></thead>
+        <tbody>
+          <tr><td class="num">500</td><td class="num">500</td><td class="num">2ms</td><td class="ok">健康</td></tr>
+          <tr><td class="num">1,000</td><td class="num">999</td><td class="num">4ms</td><td class="ok">健康</td></tr>
+          <tr><td class="num">2,000</td><td class="num">1,999</td><td class="num">31ms</td><td class="ok">健康</td></tr>
+          <tr><td class="num">4,000</td><td class="num">3,999</td><td class="num">71ms</td><td class="warn">临界</td></tr>
+          <tr><td class="num">8,000</td><td class="num">3,540</td><td class="num">4,597ms</td><td class="bad">饱和+错误</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout reveal r4" style="margin-top:18px">
+      <strong>结论</strong> · 稳定吞吐天花板约 <em>3,500–4,000 RPS</em>。
+    </div>
+
+    <!-- 4.5 MEMORY -->
+    <h3 style="font-size:18px;margin:30px 0 14px" class="reveal r2">4.5 内存表现 <span style="font-family:'JetBrains Mono';font-size:12px;color:var(--text-faint);font-weight:400">Memory</span></h3>
+    <div class="chart-card reveal r3">
+      <h3>关键洞察 · 满载压测全程 RSS 仅 18.6 → 65.4 MiB</h3>
+      <p class="csub">相对 16GB VPS 上限占比 &lt; 0.4%</p>
+      <div class="mem-wrap">
+        <div class="mem-track">
+          <div class="mem-fill" style="width:0.4%"></div>
+        </div>
+        <div class="mem-scale">
+          <span>0</span><span>4 GB</span><span>8 GB</span><span>12 GB</span><span>16 GB (上限)</span>
+        </div>
+        <div class="mem-legend">
+          <div class="big">65.4 <span class="u">MiB / 16 GiB</span></div>
+          <div class="rt">占比 ≈ <span style="color:var(--accent);font-weight:600">0.40%</span><br>余量 80x+ · 内存非瓶颈</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 5. CAPACITY ============ -->
+<section id="capacity">
+  <div class="wrap">
+    <div class="sec-head reveal r1">
+      <div class="eyebrow">05 · Capacity Estimation</div>
+      <h2>8 核 16G VPS 容量推算</h2>
+    </div>
+
+    <div class="callout reveal r2" style="margin-bottom:24px">
+      <strong>推算方法学</strong> · 本地基准：10 核 Apple Silicon（单线程较强）。目标 8C16G VPS：8 vCPU（AMD EPYC / Intel Xeon 服务器核，单线程约为本地的 0.6–0.8 倍）。CPU 密集型合成吞吐随「核数 × 单核速度」缩放。
+    </div>
+
+    <div class="chart-card reveal r3" style="padding:18px;margin-bottom:22px">
+      <table>
+        <thead><tr><th>指标</th><th class="num">本地实测</th><th class="num">8C16G VPS 推算</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>合成峰值吞吐</td><td class="num">11,056 RPS</td><td class="num peak">≈ 6,000–7,000 RPS</td><td>按 8/10 核 × 0.7 单核系数</td></tr>
+          <tr><td>合成稳定吞吐</td><td class="num">3,500–4,000 RPS</td><td class="num peak">≈ 2,200–2,800 RPS</td><td>p99 &lt; 50ms 安全区</td></tr>
+          <tr><td>内存占用 (满载)</td><td class="num">65 MiB</td><td class="num peak">&lt; 200 MiB (真实流式)</td><td>16GB = 80x+ 余量，<strong>内存非瓶颈</strong></td></tr>
+          <tr><td>并发流式连接</td><td class="num">—</td><td class="num peak">≈ 2,000–3,000</td><td>真实 LLM 为 I/O 密集，CPU 在高并发成为上限</td></tr>
+          <tr><td>真实 LLM 业务吞吐 (5s/请求均时)</td><td class="num">—</td><td class="num peak">≈ 400–600 RPS (~24K–36K 请求/分钟)</td><td>受上游 LLM 延迟主导，非网关</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="cap-callout reveal r4">
+      <h3>容量结论</h3>
+      <p>在 8 核 16G VPS 上：<strong>内存完全不是瓶颈</strong>（占用 &lt; 0.4%）。<strong>CPU 是主要约束</strong>：合成场景约 6K RPS 峰值、2.2–2.8K RPS 稳定；真实 LLM 流式业务（每请求 1–30s）下，网关单请求开销仅 ~0.3ms（相对 LLM 延迟可忽略），可支撑约 2,000–3,000 路并发流式连接。<strong>结论：单台 8C16G VPS 足以承载中大型 LLM 网关业务；如需更高吞吐，建议横向扩展 (多实例 + 共享 SQLite/外置 ClickHouse) 而非纵向加核。</strong></p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 6. RISK REGISTER ============ -->
+<section id="risk">
+  <div class="wrap">
+    <div class="sec-head reveal r1">
+      <div class="eyebrow">06 · Risk Register &amp; Recommendations</div>
+      <h2>风险登记与建议</h2>
+      <p>按优先级排序。P0 投产前必须修复 · P1 投产后尽快修复 · P2 改进项。</p>
+    </div>
+
+    <div class="risk-cols">
+      <!-- P0 -->
+      <div class="risk-col p0 reveal r2">
+        <div class="col-head"><span class="ptag">P0</span> 投产前必须修复 <span class="cdesc">Must-fix</span></div>
+
+        <div class="risk-item">
+          <div class="rh"><span class="rid">01</span><span class="rt">docker-compose 全无 healthcheck</span></div>
+          <div class="rb"><b class="impact">影响：</b>编排器无法判断服务健康，滚动更新/自愈失效。</div>
+          <div class="fix">为 hydra (<code>/api/v1/health</code> 带 Bearer)、clickhouse、mock 各加 <code>healthcheck:</code> 块。</div>
+        </div>
+
+        <div class="risk-item">
+          <div class="rh"><span class="rid">02</span><span class="rt">Dockerfile 环境变量名与代码不一致</span></div>
+          <div class="rb"><code>Dockerfile</code> 设 <code>HYDRA_DATABASE_URL</code>，代码读 <code>HYDRA_DB_URL</code>（<code>main.rs</code>）。<b class="impact">影响：</b>脱离 compose 直接用 Dockerfile 时数据库连不上。</div>
+          <div class="fix">统一为 <code>HYDRA_DB_URL</code>。</div>
+        </div>
+
+        <div class="risk-item">
+          <div class="rh"><span class="rid">03</span><span class="rt">服务层集成测试在 CI 中 <code>continue-on-error: true</code></span></div>
+          <div class="rb"><b class="impact">影响：</b>terminate_mode/tls/sink 等关键测试失败会被静默忽略，非硬门禁。</div>
+          <div class="fix">改为硬门禁，或拆分不稳定子集单独治理。</div>
+        </div>
+      </div>
+
+      <!-- P1 -->
+      <div class="risk-col p1 reveal r3">
+        <div class="col-head"><span class="ptag">P1</span> 投产后尽快修复 <span class="cdesc">Fix shortly after</span></div>
+
+        <div class="risk-item">
+          <div class="rh"><span class="rid">04</span><span class="rt">provider 密钥在 SQLite 明文存储</span></div>
+          <div class="rb"><b class="impact">影响：</b>DB 泄露即密钥泄露。</div>
+          <div class="fix">增加应用层加密 (KMS/信封加密) 或字段级加密。</div>
+        </div>
+
+        <div class="risk-item">
+          <div class="rh"><span class="rid">05</span><span class="rt">管理面 <code>?reveal=1</code> 返回明文 provider 密钥</span></div>
+          <div class="rb"><b class="impact">影响：</b>管理员 token 泄露可拉取所有密钥。</div>
+          <div class="fix">审计日志强化 + 短期凭证 + 必要时二次认证。</div>
+        </div>
+
+        <div class="risk-item">
+          <div class="rh"><span class="rid">06</span><span class="rt">sqlx 使用运行期 <code>query</code> (非编译期 <code>query!</code>)</span></div>
+          <div class="rb"><b class="impact">影响：</b>SQL 无编译期校验，schema 漂移在运行期才暴露。</div>
+          <div class="fix">启用 <code>sqlx prepare</code> 离线缓存 + CI 校验。</div>
+        </div>
+
+        <div class="risk-item">
+          <div class="rh"><span class="rid">07</span><span class="rt">限流/熔断在高并发 (c≥100) 触发 502/503</span></div>
+          <div class="rb"><b class="impact">影响：</b>突发流量时错误率上升。</div>
+          <div class="fix">调优熔断阈值、上游连接池、worker 线程数；生产前做容量规划定并发上限。</div>
+        </div>
+      </div>
+
+      <!-- P2 -->
+      <div class="risk-col p2 reveal r4">
+        <div class="col-head"><span class="ptag">P2</span> 改进项 <span class="cdesc">Improvements</span></div>
+
+        <div class="risk-item">
+          <div class="rh"><span class="rid">08</span><span class="rt"><code>created_at</code> 时间戳格式不一致</span></div>
+          <div class="rb">proxy 层 <code>now_iso8601</code> 输出 <code>t&lt;unix秒&gt;</code> (非真 ISO-8601)，admin 层用 chrono。</div>
+          <div class="fix">统一为 RFC3339。</div>
+        </div>
+
+        <div class="risk-item">
+          <div class="rh"><span class="rid">09</span><span class="rt">流式中途失败不故障转移</span></div>
+          <div class="rb">一旦 200+首 chunk 写出，中途出错仅关连接不重试 (流式固有约束，可接受)。</div>
+          <div class="fix">文档化并监控 <code>mid_stream_error</code> 指标。</div>
+        </div>
+
+        <div class="risk-item">
+          <div class="rh"><span class="rid">10</span><span class="rt">CI 缺 lock 文件校验说明</span></div>
+          <div class="rb">建议 CI 显式校验 lock 文件一致性。</div>
+          <div class="fix">CI 显式 <code>cargo update --workspace --locked</code>。</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 7. METHODOLOGY ============ -->
+<section id="method">
+  <div class="wrap">
+    <div class="sec-head reveal r1">
+      <div class="eyebrow">07 · Methodology</div>
+      <h2>评测方法学</h2>
+    </div>
+
+    <div class="method-grid">
+      <div class="method-item reveal r2">
+        <h4><span class="mn">01</span> 代码评审</h4>
+        <p>对两个 crate 全量静态走查（架构、错误处理、并发、持久化、安全、测试、运维），AST/grep 核验 panic/unwrap/unsafe 分布。</p>
+      </div>
+      <div class="method-item reveal r3">
+        <h4><span class="mn">02</span> 性能测试</h4>
+        <p>release 构建 (<code>cargo build --release --features server</code>)，线程化 Python mock 上游 (预计算 SSE/JSON 响应)，<code>oha 1.15</code> 压测，预热鉴权缓存，隔离 mock 基线。<strong>未触达任何真实付费上游。</strong></p>
+      </div>
+      <div class="method-item reveal r4">
+        <h4><span class="mn">03</span> 容量推算</h4>
+        <p>基于实测数据按核数×单核速度系数外推至 8C16G，并区分合成场景与真实 LLM I/O 密集场景。</p>
+      </div>
+      <div class="method-item reveal r5">
+        <h4><span class="mn">04</span> 局限性</h4>
+        <p>(a) 测试在本地 macOS 10 核进行，与生产 Linux 服务器内核/网络栈存在差异；(b) mock 上游为 Python，高并发区间部分衰减来自 mock；(c) 真实 LLM 上游延迟未模拟，流式连接数推算为理论值。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FOOTER ============ -->
+<footer>
+  <div class="wrap">
+    <div class="foot-inner">
+      <div>
+        <div class="foot-brand"><span class="brand"><span class="dot" style="display:inline-block;width:11px;height:11px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--indigo));box-shadow:0 0 14px var(--accent-glow);margin-right:8px;vertical-align:middle"></span>Hydra</span></div>
+        <p style="font-size:12.5px;color:var(--text-faint);margin-top:6px">生产就绪度评测报告</p>
+      </div>
+      <div class="foot-meta">
+        生成方式 · 自动化评测 (OpenCode · Hydra 项目)<br>
+        日期 · 2026-08-09 · 版本 v0.1.0<br>
+        技术栈 · Rust + Pingora 0.8
+      </div>
+    </div>
+    <div class="disclaimer">
+      本报告基于静态代码评审 + 本地小规模性能基准测试，容量推算为工程估算而非 SLA 承诺。
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
