@@ -1114,6 +1114,12 @@ async fn admission_wait_timeout_does_not_trip_breaker() {
     let client = test_client();
     let body = r#"{"model":"gpt-4"}"#;
 
+    // Warm up: ensure the proxy has bound the port before firing concurrent
+    // requests (Pingora binds asynchronously; `send_one` has no retry).
+    let warmup = send_until_ready(&client, &url, body).await;
+    assert_eq!(warmup.status(), 200, "warmup request should succeed");
+    let _ = warmup.text().await;
+
     // Fire the first request — it acquires the permit and holds it for 500ms.
     let client_a = client.clone();
     let url_a = url.clone();
@@ -1267,6 +1273,15 @@ async fn admission_capped_provider_does_not_block_second_request() {
     let url = format!("{root}/v1/chat/completions");
     let client = test_client();
     let body = r#"{"model":"gpt-4"}"#;
+
+    // Warm up: ensure the proxy has bound the port before firing concurrent
+    // requests. Pingora binds asynchronously inside `run_forever()`, and
+    // `send_one` has no retry — a pre-bind request would panic at
+    // `.expect("send")`. Every non-concurrent test in this file uses
+    // `send_until_ready` for the same reason.
+    let warmup = send_until_ready(&client, &url, body).await;
+    assert_eq!(warmup.status(), 200, "warmup request should succeed");
+    let _ = warmup.text().await;
 
     // Fire two concurrent requests. With SWRR rotation, the first picks one
     // provider and the second picks the other. Both should get 200 regardless
