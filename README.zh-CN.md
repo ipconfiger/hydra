@@ -2,6 +2,10 @@
 
 [English](README.md)
 
+> **受够了 Python LLM 网关——闲置就吃掉 20GB 内存，还在 OpenAI↔Anthropic 的有损转换里默默吞掉你的工具调用？**
+>
+> **Hydra 是基于 Rust + Pingora 的 LLM 路由网关，OpenAI 与 Anthropic 双协议原生直通——零转换、按租户 TLS、计量级用量分解（缓存 token + TTFT）——65 MiB 单体二进制，零 `unsafe` / `unwrap` / `panic`。**
+
 **高性能 LLM 路由网关。** 同时支持 **OpenAI（`/v1/chat/completions`）与 Anthropic（`/v1/messages`）** 两种客户端协议，格式同构直通（按客户端路径端到端保持同一格式，不做 OpenAI↔Anthropic 转换），路由到上游模型供应商，提供按租户鉴权、加权负载均衡、故障转移、熔断、限流、细粒度用量计量（输入/缓存/输出 token + TTFT）、按租户 TLS。基于 Rust + [Pingora](https://github.com/cloudflare/pingora)。
 
 ## 亮点 Highlights
