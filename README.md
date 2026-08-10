@@ -1,6 +1,6 @@
 # Hydra
 
-**A high-performance LLM routing gateway.** Route OpenAI-compatible client traffic to upstream model providers with per-tenant auth, weighted load balancing, failover, circuit breaking, rate limiting, granular usage metering (input/cached/output tokens + TTFT), and per-tenant TLS. Built in Rust on [Pingora](https://github.com/cloudflare/pingora).
+**A high-performance LLM routing gateway.** Route **OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`)** client traffic to upstream model providers — format-homogeneous pass-through (the client's path is preserved end-to-end, including usage parsing), with per-tenant auth, weighted load balancing, failover, circuit breaking, rate limiting, granular usage metering (input/cached/output tokens + TTFT), and per-tenant TLS. Built in Rust on [Pingora](https://github.com/cloudflare/pingora).
 
 [中文文档](README.zh-CN.md)
 
@@ -21,6 +21,7 @@ If a provider fails, Hydra **failovers** to the next candidate automatically (tr
 ## Features
 
 - **Terminate-mode proxy**: reads the full request body in `request_filter` (model extraction works for ANY position/schema — no first-chunk peeking); calls the provider via a dedicated reqwest client; streams the SSE response back through Pingora's session writer. Returns `Ok(true)` so Pingora never dials upstream.
+- **Two client protocols, format-homogeneous**: accept OpenAI (`POST /v1/chat/completions`) **and** Anthropic (`POST /v1/messages`). The path you call selects the format end-to-end — the upstream URL, request body, and usage parser all match (no OpenAI↔Anthropic conversion). `UsageScanner` picks `ProviderKind::Anthropic` for `/v1/messages` (parses `input_tokens`/`output_tokens`/`cache_read_input_tokens`), `Generic` otherwise.
 - **Routing**: model name → providers ∩ tenant-allowed providers; smooth weighted round-robin (Nginx SWRR).
 - **External auth**: each tenant points to its own `auth_url`; Hydra caches verdicts 5 min and exposes an invalidation endpoint (the tenant decides欠费/封禁).
 - **Failover + circuit breaker**: the failover loop tries each candidate provider in sequence; consecutive failures trip a dead-set with background probing. Full body replay is O(1) `Bytes::clone()`.

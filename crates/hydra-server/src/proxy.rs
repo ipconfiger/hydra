@@ -299,6 +299,17 @@ impl ProxyHttp for HydraProxy {
         let method = req_header.method.as_str();
         let is_v1_route = req_path.starts_with("/v1/");
         let has_body = method == "POST" || method == "PUT" || method == "PATCH";
+        // Format-homogeneous pass-through (§9.4): the client's request path
+        // selects the usage-parser family. /v1/messages → Anthropic schema
+        // (input_tokens/output_tokens/cache_read_input_tokens); everything
+        // else → Generic (OpenAI-compatible) — the safe default with ZERO
+        // behaviour change for /v1/chat/completions.
+        let api_kind = if req_path.ends_with("/v1/messages") {
+            hydra_core::model::ProviderKind::Anthropic
+        } else {
+            hydra_core::model::ProviderKind::Generic
+        };
+        ctx.scanner = hydra_core::sse::UsageScanner::new(api_kind);
         // Snapshot the original request header (method/path/headers) so
         // build_request can rebuild the upstream request from it later. The
         // immutable borrow of `session` ends here (NLL), allowing the mutable

@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-**高性能 LLM 路由网关。** 将 OpenAI 兼容的客户端流量路由到上游模型供应商，提供按租户鉴权、加权负载均衡、故障转移、熔断、限流、细粒度用量计量（输入/缓存/输出 token + TTFT）、按租户 TLS。基于 Rust + [Pingora](https://github.com/cloudflare/pingora)。
+**高性能 LLM 路由网关。** 同时支持 **OpenAI（`/v1/chat/completions`）与 Anthropic（`/v1/messages`）** 两种客户端协议，格式同构直通（按客户端路径端到端保持同一格式，不做 OpenAI↔Anthropic 转换），路由到上游模型供应商，提供按租户鉴权、加权负载均衡、故障转移、熔断、限流、细粒度用量计量（输入/缓存/输出 token + TTFT）、按租户 TLS。基于 Rust + [Pingora](https://github.com/cloudflare/pingora)。
 
 ---
 
