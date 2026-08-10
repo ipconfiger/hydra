@@ -546,7 +546,7 @@ footer{padding:48px 0 60px;border-top:1px solid var(--border);margin-top:40px}
       </div>
     </div>
     <p class="reveal r6" style="margin-top:14px;font-size:12.5px;color:var(--text-faint);font-family:'JetBrains Mono';text-align:center">
-      测试规模 · core <b style="color:var(--accent)">88 → 101</b> · server <b style="color:var(--accent)">138 → 159</b> （全程 <code>clippy -D warnings</code> 干净）
+      测试规模 · core <b style="color:var(--accent)">88 → 106</b> · server <b style="color:var(--accent)">138 → 163</b> （全程 <code>clippy -D warnings</code> 干净）
     </p>
   </div>
 </header>
@@ -563,7 +563,7 @@ footer{padding:48px 0 60px;border-top:1px solid var(--border);margin-top:40px}
         <p>Hydra 是一个基于 Rust + Pingora 0.8 构建的高性能 LLM 路由网关，采用「纯领域核心 (hydra-core) + I/O 外壳 (hydra-server)」的两层架构，核心层零 I/O 依赖并有 CI 强制的依赖防火墙。代码工程质量出色：两个 crate 均开启 <code>#![forbid(unsafe_code)]</code>，生产代码中<strong>零</strong> <code>unwrap()</code>/<code>panic!</code>/<code>unsafe</code>（全部限制在 <code>#[cfg(test)]</code> 内）。</p>
         <p>基准性能测试（本地 10 核机器，使用线程化 mock 上游，未触达真实付费上游）显示：网关单请求开销约 0.3ms，峰值合成吞吐约 <strong>11,000 RPS</strong>（c=25，p99=4.39ms），限速下的稳定吞吐天花板约 <strong>3,500–4,000 RPS</strong>。内存表现极其出色——满载压力下 RSS 仅 <strong>18.6 → 65.4 MiB</strong>。</p>
         <p>按 8 核 16G VPS 推算，预计可承载 <strong>6,000 RPS 合成峰值</strong>、<strong>2,000–3,000 路并发流式连接</strong>，内存占用远低于上限。</p>
-        <p>结论（补救后复评）：<strong>生产就绪</strong>。首轮评测中的全部 P0 与几乎全部 P1 已修复——provider 密钥 AES-256-GCM 落库加密（fail-closed 启动）、sqlx 编译期 <code>query!</code> 校验 + <code>.sqlx</code> 离线缓存、管理面不再返回明文（始终掩码）、mid-stream 错误指标补齐，并新增 per-provider 有界接纳队列（Envoy 模式，opt-in）。测试规模由 core 88→101、server 138→159 增长，热路径负载冒烟<strong>零回归</strong>（~10.5k RPS @ c=25）。剩余项均为非阻断的改进型条目（见风险登记表）。</p>
+        <p>结论（补救后复评）：<strong>生产就绪</strong>。首轮评测中的全部 P0 与几乎全部 P1 已修复——provider 密钥 AES-256-GCM 落库加密（fail-closed 启动）、sqlx 编译期 <code>query!</code> 校验 + <code>.sqlx</code> 离线缓存、管理面不再返回明文（始终掩码）、mid-stream 错误指标补齐，并新增 per-provider 有界接纳队列（Envoy 模式，opt-in）。测试规模由 core 88→106、server 138→163 增长，热路径负载冒烟<strong>零回归</strong>（~10.5k RPS @ c=25）。剩余项均为非阻断的改进型条目（见风险登记表）。</p>
       </div>
     </div>
   </div>
@@ -639,7 +639,7 @@ footer{padding:48px 0 60px;border-top:1px solid var(--border);margin-top:40px}
         <div class="sc-ico"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6l1 3h4v15H4V5h4l1-3z"/><path d="M9 13l2 2 4-4"/></svg></div>
         <div class="sc-name">测试覆盖<small>Testing</small></div>
         <div class="stars"><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg class="star-on" viewBox="0 0 24 24"><path d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg><svg viewBox="0 0 24 24"><path fill="url(#halfStar)" d="M12 2l2.9 6.2 6.8.6-5.1 4.5 1.5 6.7L12 17.3 5.9 20l1.5-6.7L2.3 8.8l6.8-.6L12 2z"/></svg></div>
-        <div class="sc-reason">服务层测试已成 CI 硬门禁（<code style="font-size:11px">--features server</code>）；<code style="font-size:11px">sqlx</code> 离线校验；core 101 / server 159 测试；扣分：少量并发测试需手动复核稳定性。</div>
+        <div class="sc-reason">服务层测试已成 CI 硬门禁（<code style="font-size:11px">--features server</code>）；<code style="font-size:11px">sqlx</code> 离线校验；core 106 / server 163 测试；扣分：少量并发测试需手动复核稳定性。</div>
       </div>
 
       <!-- 8 Ops/Deploy 4.5/5 -->
