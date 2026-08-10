@@ -82,21 +82,28 @@ impl UsageScanner {
         let has_done = memmem::find(buf, b"[DONE]").is_some();
 
         if has_usage {
-            // Locate the ~50-byte bare usage object (brace-matched), whether the
-            // carrier is an SSE `data:` payload or a raw non-stream JSON body.
-            if let Some(json) = extract_usage_json(buf) {
+            // Absorb EVERY usage-bearing payload in the chunk, in forward
+            // stream order. Multiple usage objects may coalesce into one TCP
+            // chunk (e.g. Anthropic `message_start` + `message_delta` arriving
+            // together); parsing only the first would silently drop the rest.
+            let mut absorbed_any = false;
+            for json in extract_all_usage_objects(buf) {
                 if self.absorb(json) {
-                    return if has_done {
-                        ScanResult::Done
-                    } else {
-                        ScanResult::Found
-                    };
+                    absorbed_any = true;
                 }
             }
-            // `"usage"` was present but no payload parsed (incomplete across a
-            // boundary, or malformed) — never panic; buffer the trailing line.
+            // Buffer any incomplete trailing data: line for cross-chunk
+            // reassembly (a usage object split mid-JSON across two chunks).
+            // `buffer_incomplete_tail` skips already-absorbed complete objects,
+            // so this never double-counts.
             self.buffer_incomplete_tail(buf);
-            return if has_done {
+            return if absorbed_any {
+                if has_done {
+                    ScanResult::Done
+                } else {
+                    ScanResult::Found
+                }
+            } else if has_done {
                 ScanResult::Done
             } else {
                 ScanResult::Skip
@@ -150,18 +157,25 @@ impl UsageScanner {
                 self.seen_any = true;
                 true
             }
-            // Anthropic: message_delta usage is incremental — accumulate the
-            // input/output token deltas across chunks.
+            // Anthropic: all usage fields are final/cumulative values.
+            // `message_start.usage` carries the final `input_tokens` and an
+            // initial `output_tokens` (often 1); `message_delta.usage` carries
+            // the cumulative/final `output_tokens` and `cache_read_input_tokens`.
+            // Last-wins (assignment) in stream order, so message_delta's values
+            // override message_start's initial ones — never delta-sum.
             ProviderKind::Anthropic => {
                 let Ok(u) = serde_json::from_slice::<AnthropicUsageFields>(json) else {
                     return false;
                 };
-                accumulate(&mut self.usage.prompt_tokens, u.input_tokens);
-                accumulate(&mut self.usage.completion_tokens, u.output_tokens);
-                // Anthropic reports cache reads via `cache_read_input_tokens`.
-                // It is a running total (not a delta) on the final usage object,
-                // so last-wins (not accumulate) is correct.
-                accumulate(&mut self.usage.cached_tokens, u.cache_read_input_tokens);
+                if let Some(v) = u.input_tokens {
+                    self.usage.prompt_tokens = Some(v);
+                }
+                if let Some(v) = u.output_tokens {
+                    self.usage.completion_tokens = Some(v);
+                }
+                if let Some(v) = u.cache_read_input_tokens {
+                    self.usage.cached_tokens = Some(v);
+                }
                 self.seen_any = true;
                 true
             }
@@ -171,23 +185,29 @@ impl UsageScanner {
     /// Carry an incomplete trailing `data:` line into the next chunk. Only
     /// activates when the buffer is not newline-terminated and the trailing
     /// portion begins a `data:` line, so aligned chunks stay zero-allocation.
+    ///
+    /// If the trailing line already yielded a COMPLETE usage object (absorbed
+    /// above), it is NOT re-buffered — that would double-count on the next
+    /// chunk. Only genuinely incomplete usage JSON (or non-usage `data:` lines)
+    /// is carried forward for reassembly.
     fn buffer_incomplete_tail(&mut self, buf: &[u8]) {
         if buf.is_empty() || buf.ends_with(b"\n") {
             return;
         }
         let start = memrchr(b'\n', buf).map(|i| i + 1).unwrap_or(0);
         let trailing = &buf[start..];
-        if memmem::find(trailing, b"data:").is_some() {
-            self.tail.extend_from_slice(trailing);
+        if memmem::find(trailing, b"data:").is_none() {
+            return;
         }
-    }
-}
-
-/// Add `delta` into `slot` (treating a `None` slot as zero), preserving `None`
-/// when `delta` itself is absent.
-fn accumulate(slot: &mut Option<u64>, delta: Option<u64>) {
-    if let Some(d) = delta {
-        *slot = Some(slot.unwrap_or(0) + d);
+        // A complete, already-absorbed usage object on the trailing line must
+        // not be re-buffered (double-count). Skip only when the brace-match
+        // succeeds; an incomplete object (no closing `}`) still needs the tail.
+        if memmem::find(trailing, b"\"usage\"").is_some()
+            && extract_usage_object(trailing).is_some()
+        {
+            return;
+        }
+        self.tail.extend_from_slice(trailing);
     }
 }
 
@@ -199,38 +219,52 @@ fn skip_ws(buf: &[u8], mut idx: usize) -> usize {
     idx
 }
 
-/// Extract the ~50-byte bare usage object as a borrowed slice.
+/// Extract every bare usage object in `buf`, in forward stream order.
 ///
-/// The carrier is the SSE `data:` payload when present, otherwise the whole
-/// buffer (non-streaming JSON). [`extract_usage_object`] then brace-matches the
-/// object following the `"usage"` key within that carrier — so the hot path
-/// deserialises only the bare usage object, never the full response body.
-fn extract_usage_json(buf: &[u8]) -> Option<&[u8]> {
-    let carrier = extract_sse_data_json(buf).unwrap_or(buf);
-    extract_usage_object(carrier)
-}
-
-/// Locate the SSE `data:` payload (borrowed) of the first `data:` line that
-/// contains a `"usage"` key. The payload is sliced up to the next newline —
-/// no full-body serde, no allocation. Returns `None` when no such line exists
-/// (e.g. non-streaming JSON).
-fn extract_sse_data_json(buf: &[u8]) -> Option<&[u8]> {
+/// For SSE-framed responses, iterates ALL `data:` lines that contain a
+/// `"usage"` key and brace-matches the usage object within each payload — so
+/// multiple usage objects coalesced into one chunk (e.g. Anthropic
+/// `message_start` + `message_delta`) are all yielded. For non-streaming JSON
+/// (no `data:` framing), brace-matches the usage object in the raw buffer.
+/// Returns borrowed slices — the JSON content is never copied.
+fn extract_all_usage_objects(buf: &[u8]) -> Vec<&'_ [u8]> {
+    let mut out = Vec::new();
     let mut search_from = 0;
-    while let Some(rest) = buf.get(search_from..) {
-        let rel = memmem::find(rest, b"data:")?;
+    let mut found_sse_line = false;
+    while search_from < buf.len() {
+        let Some(rest) = buf.get(search_from..) else {
+            break;
+        };
+        let Some(rel) = memmem::find(rest, b"data:") else {
+            break;
+        };
         let data_start = search_from + rel;
         let payload_start = skip_ws(buf, data_start + b"data:".len());
-        let line_end = match memchr(b'\n', buf.get(payload_start..)?) {
+        let line_end = match buf.get(payload_start..).and_then(|r| memchr(b'\n', r)) {
             Some(r) => payload_start + r,
             None => buf.len(),
         };
-        let payload = buf.get(payload_start..line_end)?;
+        let Some(payload) = buf.get(payload_start..line_end) else {
+            break;
+        };
         if memmem::find(payload, b"\"usage\"").is_some() {
-            return Some(payload);
+            found_sse_line = true;
+            if let Some(json) = extract_usage_object(payload) {
+                out.push(json);
+            }
+        }
+        if line_end <= data_start {
+            break; // defensive: avoid infinite loop on zero-advance
         }
         search_from = line_end;
     }
-    None
+    if !found_sse_line {
+        // Non-streaming JSON (no SSE `data:` framing): brace-match the whole buffer.
+        if let Some(json) = extract_usage_object(buf) {
+            out.push(json);
+        }
+    }
+    out
 }
 
 /// For non-streaming JSON (no SSE `data:` framing): brace-match the object

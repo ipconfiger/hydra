@@ -3,7 +3,8 @@
 //! Each chunk is scanned with `memchr` for `"usage"` (zero-alloc, ~10 GB/s).
 //! On a hit, only the ~50-byte `data:` payload (or the brace-matched usage
 //! object for non-stream JSON) is deserialised. `ProviderKind` drives schema
-//! normalisation; Anthropic deltas accumulate. `data: [DONE]` terminates.
+//! normalisation; Anthropic usage fields are cumulative (last-wins).
+//! `data: [DONE]` terminates.
 
 use hydra_core::model::{ProviderKind, Usage};
 use hydra_core::sse::{ScanResult, UsageScanner};
@@ -71,24 +72,30 @@ fn usage_anthropic_message_delta() {
     );
 }
 
-// T5.13 — Anthropic incremental: multiple deltas' output_tokens accumulate.
+// T5.13 — Anthropic cumulative usage: output_tokens is a running total, so
+// last-wins (not delta-sum) is correct across message_delta events.
 #[test]
-fn usage_anthropic_incremental_accumulate() {
+fn usage_anthropic_cumulative_last_wins() {
     let mut scanner = UsageScanner::new(ProviderKind::Anthropic);
-    // First delta establishes input_tokens and an initial output delta.
+    // message_start establishes input_tokens and an initial output_tokens=1.
     scanner.scan_chunk(
-        b"event: message_delta\ndata: {\"usage\":{\"input_tokens\":40,\"output_tokens\":5}}\n\n",
+        b"event: message_start\ndata: {\"type\":\"message_start\",\"usage\":{\"input_tokens\":40,\"output_tokens\":1}}\n\n",
     );
-    // Subsequent deltas carry only output_tokens increments.
-    scanner.scan_chunk(b"event: message_delta\ndata: {\"usage\":{\"output_tokens\":3}}\n\n");
-    scanner.scan_chunk(b"event: message_delta\ndata: {\"usage\":{\"output_tokens\":2}}\n\n");
+    // message_delta carries the CUMULATIVE output_tokens (not a delta):
+    // 5, then 12 — the running total, not 5+3+2.
+    scanner.scan_chunk(
+        b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+    );
+    scanner.scan_chunk(
+        b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":12}}\n\n",
+    );
 
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
             prompt_tokens: Some(40),     // single input_tokens occurrence
-            completion_tokens: Some(10), // 5 + 3 + 2 accumulated
-            total_tokens: Some(50),      // computed
+            completion_tokens: Some(12), // last-wins: 12, NOT 1+5+12=18
+            total_tokens: Some(52),      // computed: 40 + 12
             ..Default::default()
         })
     );
@@ -280,4 +287,150 @@ fn usage_openai_details_without_cached_field() {
     scanner.scan_chunk(chunk);
     let u = scanner.finalize().expect("usage");
     assert_eq!(u.cached_tokens, None);
+}
+
+// ===========================================================================
+// Anthropic coalesced-chunk regression (BUG 1 + BUG 2 fix).
+//
+// When multiple usage-bearing SSE events arrive in ONE TCP chunk, ALL must be
+// parsed (BUG 1 fix). And Anthropic usage fields are cumulative → last-wins,
+// so message_delta's output_tokens/cache_read_input_tokens override
+// message_start's initial values (BUG 2 fix).
+// ===========================================================================
+
+// T5.21 — Anthropic message_start + message_delta COALESCED in one chunk.
+// Before the BUG 1 fix only message_start's usage (input=42, output=1) was
+// parsed; message_delta (output=13, cache_read=7) was silently dropped.
+#[test]
+fn usage_anthropic_coalesced_in_one_chunk() {
+    let mut scanner = UsageScanner::new(ProviderKind::Anthropic);
+    // A single chunk carrying two usage-bearing events back-to-back — exactly
+    // what happens when a fast upstream or coalescing proxy delivers the whole
+    // SSE body in one TCP segment.
+    let chunk = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":42,\"output_tokens\":1}}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":13,\"cache_read_input_tokens\":7}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    assert_eq!(scanner.scan_chunk(chunk.as_bytes()), ScanResult::Found);
+    assert_eq!(
+        scanner.finalize(),
+        Some(Usage {
+            prompt_tokens: Some(42),     // input_tokens from message_start
+            completion_tokens: Some(13), // output_tokens: last-wins (13, not 1)
+            total_tokens: Some(55),      // computed: 42 + 13
+            cached_tokens: Some(7),      // cache_read_input_tokens from message_delta
+        })
+    );
+}
+
+// T5.22 — Same events fed as TWO separate chunks → identical result.
+// Proves the coalesced (one-chunk) and separate (two-chunk) code paths agree.
+#[test]
+fn usage_anthropic_separate_chunks() {
+    let mut scanner = UsageScanner::new(ProviderKind::Anthropic);
+    scanner.scan_chunk(
+        concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":42,\"output_tokens\":1}}}\n\n",
+        )
+        .as_bytes(),
+    );
+    scanner.scan_chunk(
+        concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":13,\"cache_read_input_tokens\":7}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        )
+        .as_bytes(),
+    );
+    assert_eq!(
+        scanner.finalize(),
+        Some(Usage {
+            prompt_tokens: Some(42),
+            completion_tokens: Some(13),
+            total_tokens: Some(55),
+            cached_tokens: Some(7),
+        })
+    );
+}
+
+// T5.23 — OpenAI/Generic single-chunk regression: the multi-line refactor must
+// not change the OpenAI path (single usage object, last-wins, unchanged).
+#[test]
+fn usage_openai_single_chunk_unchanged() {
+    let mut scanner = UsageScanner::new(ProviderKind::Generic);
+    let chunk = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n";
+    assert_eq!(scanner.scan_chunk(chunk), ScanResult::Found);
+    assert_eq!(
+        scanner.finalize(),
+        Some(Usage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            total_tokens: Some(15),
+            ..Default::default()
+        })
+    );
+}
+
+// T5.24 — Anthropic usage object split mid-JSON across two chunks: the tail
+// buffer reassembles it, and message_delta's cumulative output_tokens still
+// overrides message_start's initial value after reassembly.
+#[test]
+fn usage_anthropic_split_across_chunks() {
+    let mut scanner = UsageScanner::new(ProviderKind::Anthropic);
+    // Chunk 1: message_start fully received, message_delta's usage line cut
+    // mid-JSON (no closing brace yet).
+    scanner.scan_chunk(
+        concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"usage\":{\"input_tokens\":42,\"output_tokens\":1}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":13,\"cache_read_input",
+        )
+        .as_bytes(),
+    );
+    // Chunk 2 completes the usage object.
+    scanner
+        .scan_chunk(b"_tokens\":7}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+
+    assert_eq!(
+        scanner.finalize(),
+        Some(Usage {
+            prompt_tokens: Some(42),
+            completion_tokens: Some(13),
+            total_tokens: Some(55),
+            cached_tokens: Some(7),
+        })
+    );
+}
+
+// T5.25 — OpenAI usage object split mid-JSON across two chunks: the multi-line
+// loop + tail buffer must not break the original cross-chunk reassembly path.
+#[test]
+fn usage_openai_split_across_chunks_no_double_count() {
+    let mut scanner = UsageScanner::new(ProviderKind::OpenAi);
+    // Chunk 1 carries a complete usage object on a `\n`-terminated line, then
+    // starts a second data: line without a trailing newline.
+    scanner.scan_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\
+         data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_to",
+    );
+    // Chunk 2 completes the second usage line. The first chunk already
+    // buffered the incomplete trailing data: line via the tail.
+    let result = scanner.scan_chunk(b"kens\":5,\"total_tokens\":15}}\n");
+    assert_eq!(result, ScanResult::Found);
+    assert_eq!(
+        scanner.finalize(),
+        Some(Usage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            total_tokens: Some(15),
+            ..Default::default()
+        })
+    );
 }
