@@ -4,6 +4,21 @@
 
 [中文文档](README.zh-CN.md)
 
+## Highlights
+
+> Measured on a 10-core machine against a threaded mock upstream (no real paid provider hit). Full methodology + 8C16G VPS capacity extrapolation in the [evaluation report](docs/evaluation-report.html).
+
+| | metric | note |
+|---|---|---|
+| ⚡ | **11,056 RPS** peak throughput | c=25, p99 = 4.39 ms |
+| 🪶 | **65 MiB** RSS under full load | 18.6 → 65.4 MiB; < 0.4% of a 16 GB box |
+| ⏱️ | **~0.3 ms** per-request gateway overhead | negligible vs. LLM latency |
+| 🛡️ | **0** production `unwrap`/`panic`/`unsafe` | both crates `#![forbid(unsafe_code)]` |
+| 🔐 | **AES-256-GCM** provider keys at rest | fail-closed boot; admin API never returns plaintext |
+| 🧪 | **core 106 + server 163** tests, `clippy -D warnings` clean | CI hard gate |
+
+**Production-readiness: 9.2 / 10** — see the [full report](docs/evaluation-report.html).
+
 ---
 
 ## What it is
