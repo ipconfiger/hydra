@@ -760,6 +760,14 @@ function collectBody(cfg, inputs, record) {
   for (const f of cfg.fields) body[f.name] = readValue(f, inputs[f.name]);
   // preserve server-managed timestamps on edit
   if (record && record.created_at) body.created_at = record.created_at;
+  if (!record) {
+    // The admin API deserialises the request body directly into the entity
+    // structs, where the timestamp columns are REQUIRED fields (the server
+    // defaults them when empty, see admin/handlers.rs). Send them on create so
+    // the POST succeeds; serde ignores them for entities without timestamps.
+    body.created_at = body.created_at ?? "";
+    body.updated_at = body.updated_at ?? "";
+  }
   return body;
 }
 
