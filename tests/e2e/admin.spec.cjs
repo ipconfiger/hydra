@@ -12,6 +12,10 @@
  * tests/e2e/README.md). It does NOT spawn the binary itself: the binary needs
  * a real Pingora listener + a SQLite file, which is environment-specific.
  *
+ * Selectors target the CURRENT admin-ui (sidebar #nav > button.nav-item[data-key],
+ * generic modal form .modal-overlay > form.form-grid, inputs keyed by
+ * [data-field], content table at #content table) as of commit d508daa.
+ *
  * Config: HYDRA_BASE (default http://127.0.0.1:8081), HYDRA_ADMIN_TOKEN.
  */
 // @ts-check
@@ -39,6 +43,16 @@ async function api(method, path, { body } = {}) {
     try { json = JSON.parse(text); } catch { json = text; }
   }
   return { status: res.status, json };
+}
+
+/** Sidebar nav button for a section key (current UI: #nav .nav-item[data-key]). */
+function navItem(page, key) {
+  return page.locator(`#nav button.nav-item[data-key="${key}"]`);
+}
+
+/** "New <singular>" toolbar button in the section panel head. */
+function newButton(page, name) {
+  return page.getByRole('button', { name });
 }
 
 /** Sign in via the UI overlay. */
@@ -81,24 +95,24 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
   test('T2.2 create provider via UI → appears in list → persisted via /api', async ({ page }) => {
     await signIn(page);
 
-    // Open the Providers tab and the New form.
-    await page.click('nav.tabs button[data-tab="providers"]');
-    await page.click('#provider-new');
+    // Open the Providers section and the New form.
+    await navItem(page, 'providers').click();
+    await newButton(page, 'New provider').click();
     const id = `${RUN_ID}-prov`;
-    await page.fill('[name="id"]', id);
-    await page.fill('[name="key"]', `${RUN_ID}-key`);
-    await page.fill('[name="name"]', 'Playwright Provider');
-    await page.fill('[name="endpoint"]', 'https://pw-upstream.example.com');
-    await page.fill('[name="weight"]', '2');
-    await page.click('#provider-form button.btn.primary');
+    await page.fill('[data-field="id"]', id);
+    await page.fill('[data-field="key"]', `${RUN_ID}-key`);
+    await page.fill('[data-field="name"]', 'Playwright Provider');
+    await page.fill('[data-field="endpoint"]', 'https://pw-upstream.example.com');
+    await page.fill('[data-field="weight"]', '2');
+    await page.locator('.modal-foot button.btn.primary').click();
 
-    // The form hides on success and a toast appears.
-    await expect(page.locator('#provider-form')).toBeHidden({ timeout: 5000 });
-    await expect(page.locator('#toast')).toContainText(/Saved provider/);
+    // The modal hides on success and a toast appears.
+    await expect(page.locator('.modal-overlay')).toBeHidden({ timeout: 5000 });
+    await expect(page.locator('#toast-root .toast').last()).toContainText(/Created provider/);
 
     // The list now contains the row (id + endpoint).
-    await expect(page.locator('#providers-table tbody')).toContainText(id);
-    await expect(page.locator('#providers-table tbody')).toContainText('pw-upstream.example.com');
+    await expect(page.locator('#content table tbody')).toContainText(id);
+    await expect(page.locator('#content table tbody')).toContainText('pw-upstream.example.com');
 
     // DB persistence: a direct /api GET by id returns the row.
     const { status, json } = await api('GET', `/providers/${id}`);
@@ -112,17 +126,17 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
     await signIn(page);
 
     // Create a tenant via the UI (auth_url is required).
-    await page.click('nav.tabs button[data-tab="tenants"]');
-    await page.click('#tenant-new');
+    await navItem(page, 'tenants').click();
+    await newButton(page, 'New tenant').click();
     const tid = `${RUN_ID}-tenant`;
-    await page.fill('[name="id"]', tid);
-    await page.fill('[name="name"]', 'Playwright Tenant');
-    await page.fill('[name="domain"]', `${RUN_ID}.example.com`);
-    await page.fill('[name="auth_url"]', 'https://auth.pw.example.com/v1/verify');
-    await page.click('#tenant-form button.btn.primary');
-    await expect(page.locator('#tenant-form')).toBeHidden({ timeout: 5000 });
-    await expect(page.locator('#tenants-table tbody')).toContainText(tid);
-    await expect(page.locator('#tenants-table tbody')).toContainText('auth.pw.example.com');
+    await page.fill('[data-field="id"]', tid);
+    await page.fill('[data-field="name"]', 'Playwright Tenant');
+    await page.fill('[data-field="domain"]', `${RUN_ID}.example.com`);
+    await page.fill('[data-field="auth_url"]', 'https://auth.pw.example.com/v1/verify');
+    await page.locator('.modal-foot button.btn.primary').click();
+    await expect(page.locator('.modal-overlay')).toBeHidden({ timeout: 5000 });
+    await expect(page.locator('#content table tbody')).toContainText(tid);
+    await expect(page.locator('#content table tbody')).toContainText('auth.pw.example.com');
 
     // Create a provider + model + key to associate.
     const pid = `${RUN_ID}-tp`;
@@ -137,25 +151,25 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
       body: { id: mid, key: `${RUN_ID}-model`, name: 'M', provider_id: pid, status: 1 },
     });
 
-    // Associate via the TenantAccess UI.
-    await page.click('nav.tabs button[data-tab="tenant-access"]');
-    await page.click('#tp-new');
+    // Associate via the TenantAccess section (tenant/provider are FK selects).
+    await navItem(page, 'tenant-providers').click();
+    await newButton(page, 'New access').click();
     const tpid = `${RUN_ID}-tpa`;
-    await page.fill('[name="id"]', tpid);
-    await page.fill('[name="tenant_id"]', tid);
-    await page.fill('[name="provider_id"]', pid);
-    await page.click('#tp-form button.btn.primary');
-    await expect(page.locator('#tenant-access-table tbody')).toContainText(tpid);
+    await page.fill('[data-field="id"]', tpid);
+    await page.selectOption('[data-field="tenant_id"]', tid);
+    await page.selectOption('[data-field="provider_id"]', pid);
+    await page.locator('.modal-foot button.btn.primary').click();
+    await expect(page.locator('#content table tbody')).toContainText(tpid);
 
-    // And the TenantModels gate.
-    await page.click('nav.tabs button[data-tab="tenant-models"]');
-    await page.click('#tm-new');
+    // And the TenantModels gate (tenant is an FK select, model_key is text).
+    await navItem(page, 'tenant-models').click();
+    await newButton(page, 'New model gate').click();
     const tmid = `${RUN_ID}-tma`;
-    await page.fill('[name="id"]', tmid);
-    await page.fill('[name="tenant_id"]', tid);
-    await page.fill('[name="model_key"]', `${RUN_ID}-model`);
-    await page.click('#tm-form button.btn.primary');
-    await expect(page.locator('#tenant-models-table tbody')).toContainText(tmid);
+    await page.fill('[data-field="id"]', tmid);
+    await page.selectOption('[data-field="tenant_id"]', tid);
+    await page.fill('[data-field="model_key"]', `${RUN_ID}-model`);
+    await page.locator('.modal-foot button.btn.primary').click();
+    await expect(page.locator('#content table tbody')).toContainText(tmid);
 
     // Persistence via /api.
     const { status, json } = await api('GET', `/tenant-providers/${tpid}`);
@@ -166,10 +180,10 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
 
   test('T2.4 auth-cache invalidate', async ({ page }) => {
     await signIn(page);
-    await page.click('nav.tabs button[data-tab="auth-cache"]');
+    await navItem(page, 'auth-cache').click();
     await page.fill('#inv-tenant', 't-seed');
     await page.fill('#inv-keys', 'sk-nonexistent-aaa, sk-nonexistent-bbb');
-    await page.click('#inv-btn');
+    await page.getByRole('button', { name: /Invalidate/ }).click();
     // No entries match ⇒ invalidated: 0, but no error.
     await expect(page.locator('#inv-result')).toContainText(/Invalidated 0/);
   });
@@ -188,17 +202,17 @@ test.describe('Hydra admin UI — CRUD E2E', () => {
     // so we use the UI's "force reset by id" path on a non-dead id — this
     // still exercises the DELETE /breaker/<id> path and the dead-set view.
     await signIn(page);
-    await page.click('nav.tabs button[data-tab="breaker"]');
+    await navItem(page, 'breaker').click();
     await page.fill('#breaker-reset-id', pid);
-    await page.click('#breaker-reset-btn');
+    await page.locator('#content button.btn.primary').click();
     // Toast confirms the reset (id may or may not have been dead).
-    await expect(page.locator('#toast')).toContainText(/Reset/);
+    await expect(page.locator('#toast-root .toast').last()).toContainText(/Reset/);
   });
 
   test('T2.6 reload endpoint surfaces new snapshot counts', async ({ page }) => {
     await signIn(page);
-    const toast = page.locator('#toast');
+    const toast = page.locator('#toast-root .toast').last();
     await page.click('#reload-btn');
-    await expect(toast).toContainText(/Reloaded:/);
+    await expect(toast).toContainText(/Reloaded \d+ providers,\s*\d+ tenants/);
   });
 });
