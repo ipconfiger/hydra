@@ -30,10 +30,9 @@ fn rec(i: u32) -> UsageRecord {
         // (design §9.5) to prove the contract end-to-end.
         client_api_key_masked: Some(mask_key("sk-abcd1234wxyz0987")),
         status_code: 200,
-        prompt_tokens: Some(10 + i as u64),
-        completion_tokens: Some(20 + i as u64),
-        total_tokens: Some(30 + i as u64 * 2),
-        cached_tokens: Some(i as u64),
+        tokens_in: Some(10 + i as u64),
+        tokens_out: Some(20 + i as u64),
+        cache_hit_tokens: Some(i as u64),
         latency_ms: 100 + i as u64,
         forward_latency_ms: Some(5 + i as u64),
         ttft_ms: Some(50 + i as u64),
@@ -192,8 +191,7 @@ async fn sink_backoff_on_db_error() {
          id INTEGER PRIMARY KEY AUTOINCREMENT, \
          tenant_id TEXT NOT NULL, provider_id TEXT NOT NULL, model_key TEXT NOT NULL, \
          client_api_key TEXT, status_code INTEGER NOT NULL, \
-         prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER, \
-         cached_tokens INTEGER, \
+         tokens_in INTEGER, tokens_out INTEGER, cache_hit_tokens INTEGER, \
          latency_ms INTEGER NOT NULL, forward_latency_ms INTEGER, ttft_ms INTEGER, \
          upstream_host TEXT, error TEXT, \
          created_at TEXT NOT NULL DEFAULT (datetime('now')))",
@@ -293,19 +291,19 @@ async fn sink_persists_new_metrics_columns() {
     }
     assert_eq!(count_usage(&pool).await, 1);
 
-    // rec(2) ⇒ cached_tokens=2, forward_latency_ms=7, ttft_ms=52.
+    // rec(2) ⇒ cache_hit_tokens=2, forward_latency_ms=7, ttft_ms=52.
     let row = sqlx::query(
-        "SELECT cached_tokens, forward_latency_ms, ttft_ms FROM usage_record \
+        "SELECT cache_hit_tokens, forward_latency_ms, ttft_ms FROM usage_record \
          WHERE tenant_id = ?",
     )
     .bind("tenant-2")
     .fetch_one(&pool)
     .await
     .expect("select new metrics");
-    let cached: Option<i64> = row.get("cached_tokens");
+    let cached: Option<i64> = row.get("cache_hit_tokens");
     let fwd: Option<i64> = row.get("forward_latency_ms");
     let ttft: Option<i64> = row.get("ttft_ms");
-    assert_eq!(cached, Some(2), "cached_tokens persisted");
+    assert_eq!(cached, Some(2), "cache_hit_tokens persisted");
     assert_eq!(fwd, Some(7), "forward_latency_ms persisted");
     assert_eq!(ttft, Some(52), "ttft_ms persisted");
 }
@@ -318,7 +316,7 @@ async fn sink_new_metrics_null_when_absent() {
     let pool = common::setup_pool().await;
 
     let mut r = rec(0);
-    r.cached_tokens = None;
+    r.cache_hit_tokens = None;
     r.forward_latency_ms = None;
     r.ttft_ms = None;
 
@@ -334,17 +332,17 @@ async fn sink_new_metrics_null_when_absent() {
     }
 
     let row = sqlx::query(
-        "SELECT cached_tokens, forward_latency_ms, ttft_ms FROM usage_record \
+        "SELECT cache_hit_tokens, forward_latency_ms, ttft_ms FROM usage_record \
          WHERE tenant_id = ?",
     )
     .bind("tenant-0")
     .fetch_one(&pool)
     .await
     .expect("select null metrics");
-    let cached: Option<i64> = row.get("cached_tokens");
+    let cached: Option<i64> = row.get("cache_hit_tokens");
     let fwd: Option<i64> = row.get("forward_latency_ms");
     let ttft: Option<i64> = row.get("ttft_ms");
-    assert_eq!(cached, None, "cached_tokens None ⇒ NULL");
+    assert_eq!(cached, None, "cache_hit_tokens None ⇒ NULL");
     assert_eq!(fwd, None, "forward_latency_ms None ⇒ NULL");
     assert_eq!(ttft, None, "ttft_ms None ⇒ NULL");
 }

@@ -751,7 +751,7 @@ impl ProxyHttp for HydraProxy {
                 ctx.started_at.elapsed().as_secs_f64(),
             );
             if let Some(u) = usage.as_ref() {
-                if let Some(p) = u.prompt_tokens {
+                if let Some(p) = u.tokens_in {
                     crate::admin::metrics::record_tokens(
                         &tenant.id,
                         &sel.provider_id,
@@ -760,7 +760,7 @@ impl ProxyHttp for HydraProxy {
                         p,
                     );
                 }
-                if let Some(c) = u.completion_tokens {
+                if let Some(c) = u.tokens_out {
                     crate::admin::metrics::record_tokens(
                         &tenant.id,
                         &sel.provider_id,
@@ -769,7 +769,7 @@ impl ProxyHttp for HydraProxy {
                         c,
                     );
                 }
-                if let Some(cached) = u.cached_tokens {
+                if let Some(cached) = u.cache_hit_tokens {
                     crate::admin::metrics::record_cached_tokens(
                         &tenant.id,
                         &sel.provider_id,
@@ -801,15 +801,11 @@ impl ProxyHttp for HydraProxy {
                 model_key: model,
                 client_api_key_masked: masked,
                 status_code: status,
-                prompt_tokens: Some(usage.as_ref().and_then(|u| u.prompt_tokens).unwrap_or(0)),
-                completion_tokens: Some(
-                    usage
-                        .as_ref()
-                        .and_then(|u| u.completion_tokens)
-                        .unwrap_or(0),
-                ),
-                total_tokens: Some(usage.as_ref().and_then(|u| u.total_tokens).unwrap_or(0)),
-                cached_tokens: Some(usage.as_ref().and_then(|u| u.cached_tokens).unwrap_or(0)),
+                // Preserve None (→ NULL): a provider that does not report a
+                // dimension must not masquerade as a zero count.
+                tokens_in: usage.as_ref().and_then(|u| u.tokens_in),
+                tokens_out: usage.as_ref().and_then(|u| u.tokens_out),
+                cache_hit_tokens: usage.as_ref().and_then(|u| u.cache_hit_tokens),
                 latency_ms,
                 forward_latency_ms: Some(ctx.forward_latency_ms.unwrap_or(0)),
                 ttft_ms: Some(ctx.ttft_ms.unwrap_or(0)),
@@ -822,8 +818,13 @@ impl ProxyHttp for HydraProxy {
             let _ = self.state.sink.record(record).await;
         }
 
-        // Token-window accounting in the logging phase (§10.3).
-        let total = usage.as_ref().and_then(|u| u.total_tokens).unwrap_or(0);
+        // Token-window accounting in the logging phase (§10.3). The limiter
+        // needs a single total-token quantity; derive it locally from the
+        // neutral fields (the metering record stores no derived total).
+        let total = usage
+            .as_ref()
+            .map(|u| u.tokens_in.unwrap_or(0) + u.tokens_out.unwrap_or(0))
+            .unwrap_or(0);
         if total > 0 {
             if let (Some(tenant), Some(sel), Some(model)) = (
                 ctx.tenant.as_ref(),

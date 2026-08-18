@@ -9,9 +9,9 @@
 //! Both tests send a request through a real Pingora proxy backed by a wiremock
 //! mock upstream and assert the recorded `UsageRecord` tokens. The usage
 //! recording is the single functional difference between the two paths: if the
-//! wrong scanner kind were selected, `cached_tokens` (Anthropic-only field
+//! wrong scanner kind were selected, `cache_hit_tokens` (Anthropic-only field
 //! `cache_read_input_tokens`) would be `None` under Generic, and
-//! `prompt_tokens`/`completion_tokens` would fail to parse under the wrong
+//! `tokens_in`/`tokens_out` would fail to parse under the wrong
 //! schema.
 
 mod common;
@@ -241,11 +241,11 @@ impl RecordingSink {
 /// A non-streaming Anthropic Messages-API JSON response carries a single
 /// complete `usage` object with Anthropic field names (`input_tokens`,
 /// `output_tokens`, `cache_read_input_tokens`). The Anthropic scanner parses
-/// these into prompt/completion/cached and computes total = prompt + completion.
+/// these into the neutral tokens_in / cache_hit_tokens / tokens_out fields.
 ///
 /// This PROVES the Anthropic scanner was selected: the Generic/OpenAI schema
 /// would not parse `cache_read_input_tokens` (it is not an `OpenAiUsageFields`
-/// member), so `cached_tokens` would be `None` — the distinguishing assertion.
+/// member), so `cache_hit_tokens` would be `None` — the distinguishing assertion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v1_messages_selects_anthropic_usage_scanner() {
     let auth_server = MockServer::start().await;
@@ -317,23 +317,14 @@ async fn v1_messages_selects_anthropic_usage_scanner() {
     let records = recording.records();
     assert_eq!(records.len(), 1, "exactly one usage record expected");
     let r = &records[0];
-    // Anthropic scanner: input_tokens → prompt, output_tokens → completion,
-    // cache_read_input_tokens → cached, total computed as 42 + 13 = 55.
-    assert_eq!(r.prompt_tokens, Some(42), "input_tokens → prompt_tokens");
+    // Anthropic scanner: input_tokens → tokens_in, output_tokens → tokens_out,
+    // cache_read_input_tokens → cache_hit_tokens. No derived total is stored.
+    assert_eq!(r.tokens_in, Some(42), "input_tokens → tokens_in");
+    assert_eq!(r.tokens_out, Some(13), "output_tokens → tokens_out");
     assert_eq!(
-        r.completion_tokens,
-        Some(13),
-        "output_tokens → completion_tokens"
-    );
-    assert_eq!(
-        r.cached_tokens,
+        r.cache_hit_tokens,
         Some(7),
-        "cache_read_input_tokens → cached_tokens (Anthropic-only; Generic would be None)"
-    );
-    assert_eq!(
-        r.total_tokens,
-        Some(55),
-        "total = prompt + completion (computed)"
+        "cache_read_input_tokens → cache_hit_tokens (Anthropic-only; Generic would be None)"
     );
     assert_eq!(r.model_key, "claude-3-5-sonnet-test");
     assert_eq!(r.status_code, 200);
@@ -341,8 +332,9 @@ async fn v1_messages_selects_anthropic_usage_scanner() {
 
 /// **Test B — `/v1/chat/completions` regression (Generic, unchanged).**
 ///
-/// The OpenAI-compatible path must parse `prompt_tokens`/`completion_tokens`/
-/// `total_tokens` exactly as before — ZERO behaviour change for the default
+/// The OpenAI-compatible path must parse `prompt_tokens`/`completion_tokens`
+/// into the neutral `tokens_in`/`tokens_out` exactly as before — ZERO
+/// behaviour change for the default
 /// path. Proves the `Generic` scanner is still selected for non-`/v1/messages`
 /// routes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -413,10 +405,10 @@ async fn v1_chat_completions_regression_generic_scanner() {
     let records = recording.records();
     assert_eq!(records.len(), 1, "exactly one usage record expected");
     let r = &records[0];
-    // Generic scanner: OpenAI-style fields parsed directly.
-    assert_eq!(r.prompt_tokens, Some(10));
-    assert_eq!(r.completion_tokens, Some(5));
-    assert_eq!(r.total_tokens, Some(15));
+    // Generic scanner: OpenAI-style fields parsed into neutral names.
+    assert_eq!(r.tokens_in, Some(10));
+    assert_eq!(r.tokens_out, Some(5));
+    assert_eq!(r.cache_hit_tokens, None);
     assert_eq!(r.model_key, "gpt-4");
     assert_eq!(r.status_code, 200);
 }

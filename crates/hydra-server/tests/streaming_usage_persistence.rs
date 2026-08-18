@@ -211,7 +211,6 @@ async fn send_until_ready(client: &reqwest::Client, url: &str, body: &str) -> re
 struct UsageRow {
     prompt: Option<i64>,
     completion: Option<i64>,
-    total: Option<i64>,
     cached: Option<i64>,
     model_key: String,
 }
@@ -228,17 +227,16 @@ async fn wait_for_usage_row(pool: &sqlx::SqlitePool) -> UsageRow {
             .get::<i64, _>("c");
         if count > 0 {
             let row = sqlx::query(
-                "SELECT prompt_tokens, completion_tokens, total_tokens, cached_tokens, model_key \
+                "SELECT tokens_in, tokens_out, cache_hit_tokens, model_key \
                  FROM usage_record ORDER BY id DESC LIMIT 1",
             )
             .fetch_one(pool)
             .await
             .expect("select usage_record");
             return UsageRow {
-                prompt: row.get("prompt_tokens"),
-                completion: row.get("completion_tokens"),
-                total: row.get("total_tokens"),
-                cached: row.get("cached_tokens"),
+                prompt: row.get("tokens_in"),
+                completion: row.get("tokens_out"),
+                cached: row.get("cache_hit_tokens"),
                 model_key: row.get("model_key"),
             };
         }
@@ -339,13 +337,9 @@ async fn openai_streaming_usage_persists_to_sqlite() {
     // immediate flush once the bg task drains the channel).
     let row = wait_for_usage_row(&pool).await;
     assert_eq!(row.model_key, "gpt-4");
-    assert_eq!(row.prompt, Some(10), "prompt_tokens from OpenAI usage");
-    assert_eq!(
-        row.completion,
-        Some(5),
-        "completion_tokens from OpenAI usage"
-    );
-    assert_eq!(row.total, Some(15), "total_tokens from OpenAI usage");
+    assert_eq!(row.prompt, Some(10), "tokens_in from OpenAI usage");
+    assert_eq!(row.completion, Some(5), "tokens_out from OpenAI usage");
+    assert_eq!(row.cached, None, "no cache-hit field in this usage");
 }
 
 /// **Anthropic coalesced streaming SSE → SQLite**: a streaming `/v1/messages`
@@ -353,7 +347,7 @@ async fn openai_streaming_usage_persists_to_sqlite() {
 /// output_tokens:1) and `message_delta` (output_tokens:13,
 /// cache_read_input_tokens:7) in a SINGLE HTTP body (the BUG-1 coalesced-chunk
 /// scenario). Both usage objects must be parsed and persisted with correct
-/// last-wins values: prompt=42, completion=13, cached=7, total=55.
+/// last-wins values: tokens_in=42, tokens_out=13, cache_hit_tokens=7.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn anthropic_coalesced_streaming_usage_persists_to_sqlite() {
     let auth_server = MockServer::start().await;
@@ -408,7 +402,7 @@ async fn anthropic_coalesced_streaming_usage_persists_to_sqlite() {
 
     let row = wait_for_usage_row(&pool).await;
     assert_eq!(row.model_key, "claude-3-5-sonnet-test");
-    assert_eq!(row.prompt, Some(42), "input_tokens → prompt_tokens");
+    assert_eq!(row.prompt, Some(42), "input_tokens → tokens_in");
     assert_eq!(
         row.completion,
         Some(13),
@@ -417,11 +411,6 @@ async fn anthropic_coalesced_streaming_usage_persists_to_sqlite() {
     assert_eq!(
         row.cached,
         Some(7),
-        "cache_read_input_tokens → cached_tokens (Anthropic-only; proves scanner kind)"
-    );
-    assert_eq!(
-        row.total,
-        Some(55),
-        "total = prompt + completion (computed)"
+        "cache_read_input_tokens → cache_hit_tokens (Anthropic-only; proves scanner kind)"
     );
 }

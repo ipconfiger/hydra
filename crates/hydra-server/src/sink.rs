@@ -251,20 +251,19 @@ async fn insert_batch_sqlite(
         sqlx::query(
             "INSERT INTO usage_record \
              (tenant_id, provider_id, model_key, client_api_key, status_code, \
-              prompt_tokens, completion_tokens, total_tokens, cached_tokens, \
+              tokens_in, tokens_out, cache_hit_tokens, \
               latency_ms, forward_latency_ms, ttft_ms, \
               upstream_host, error, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&r.tenant_id)
         .bind(&r.provider_id)
         .bind(&r.model_key)
         .bind(&r.client_api_key_masked)
         .bind(i64::from(r.status_code))
-        .bind(r.prompt_tokens.map(|v| v as i64))
-        .bind(r.completion_tokens.map(|v| v as i64))
-        .bind(r.total_tokens.map(|v| v as i64))
-        .bind(r.cached_tokens.map(|v| v as i64))
+        .bind(r.tokens_in.map(|v| v as i64))
+        .bind(r.tokens_out.map(|v| v as i64))
+        .bind(r.cache_hit_tokens.map(|v| v as i64))
         .bind(r.latency_ms as i64)
         .bind(r.forward_latency_ms.map(|v| v as i64))
         .bind(r.ttft_ms.map(|v| v as i64))
@@ -453,11 +452,12 @@ fn drain_on_drop(tx: Option<mpsc::Sender<UsageRecord>>, join: Option<tokio::task
     }));
 }
 
-/// The `INSERT` statement. Column list matches `usage_record` (§9.5).
+/// The `INSERT` statement. Column list matches the ClickHouse `usage_record`
+/// schema (environment/clickhouse/init.sql) — provider-neutral token columns.
 #[cfg(feature = "usage-clickhouse")]
 const CLICKHOUSE_INSERT: &str =
     "INSERT INTO usage_record (tenant_id, provider_id, model_key, client_api_key, status_code, \
-     prompt_tokens, completion_tokens, total_tokens, cached_tokens, latency_ms, \
+     tokens_in, tokens_out, cache_hit_tokens, latency_ms, \
      forward_latency_ms, ttft_ms, upstream_host, error, created_at) \
      FORMAT JSONEachRow";
 
@@ -565,14 +565,12 @@ fn build_clickhouse_json_row_into(out: &mut String, r: &UsageRecord) {
     }
     out.push_str(",\"status_code\":");
     out.push_str(&r.status_code.to_string());
-    out.push_str(",\"prompt_tokens\":");
-    json_opt_u64_into(out, r.prompt_tokens);
-    out.push_str(",\"completion_tokens\":");
-    json_opt_u64_into(out, r.completion_tokens);
-    out.push_str(",\"total_tokens\":");
-    json_opt_u64_into(out, r.total_tokens);
-    out.push_str(",\"cached_tokens\":");
-    json_opt_u64_into(out, r.cached_tokens);
+    out.push_str(",\"tokens_in\":");
+    json_opt_u64_into(out, r.tokens_in);
+    out.push_str(",\"tokens_out\":");
+    json_opt_u64_into(out, r.tokens_out);
+    out.push_str(",\"cache_hit_tokens\":");
+    json_opt_u64_into(out, r.cache_hit_tokens);
     out.push_str(",\"latency_ms\":");
     out.push_str(&r.latency_ms.to_string());
     out.push_str(",\"forward_latency_ms\":");

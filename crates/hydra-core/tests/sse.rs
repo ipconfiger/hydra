@@ -1,10 +1,15 @@
-//! T5.9–T5.19 — `sse::UsageScanner` zero-copy response-side usage scanning.
+//! T5.9–T5.25 — `sse::UsageScanner` zero-copy response-side usage scanning.
 //!
 //! Each chunk is scanned with `memchr` for `"usage"` (zero-alloc, ~10 GB/s).
 //! On a hit, only the ~50-byte `data:` payload (or the brace-matched usage
 //! object for non-stream JSON) is deserialised. `ProviderKind` drives schema
 //! normalisation; Anthropic usage fields are cumulative (last-wins).
 //! `data: [DONE]` terminates.
+//!
+//! The normalised result uses provider-NEUTRAL names (design §9.5):
+//! `tokens_in` / `tokens_out` / `cache_hit_tokens` — the JSON payloads below
+//! deliberately keep the raw provider field names (`prompt_tokens`,
+//! `input_tokens`, …) to prove the mapping.
 
 use hydra_core::model::{ProviderKind, Usage};
 use hydra_core::sse::{ScanResult, UsageScanner};
@@ -27,9 +32,8 @@ fn usage_scan_finds_usage_memchr() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(3),
-            completion_tokens: Some(4),
-            total_tokens: Some(7),
+            tokens_in: Some(3),
+            tokens_out: Some(4),
             ..Default::default()
         })
     );
@@ -46,15 +50,14 @@ fn usage_openai_final_chunk() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(100),
-            completion_tokens: Some(50),
-            total_tokens: Some(150),
+            tokens_in: Some(100),
+            tokens_out: Some(50),
             ..Default::default()
         })
     );
 }
 
-// T5.12 — Anthropic message_delta: input_tokens→prompt, output_tokens→completion.
+// T5.12 — Anthropic message_delta: input_tokens→tokens_in, output_tokens→tokens_out.
 #[test]
 fn usage_anthropic_message_delta() {
     let mut scanner = UsageScanner::new(ProviderKind::Anthropic);
@@ -63,10 +66,9 @@ fn usage_anthropic_message_delta() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(12),
-            completion_tokens: Some(8),
-            // Anthropic omits total ⇒ computed as prompt + completion.
-            total_tokens: Some(20),
+            tokens_in: Some(12),
+            tokens_out: Some(8),
+            // Anthropic reports no cache-hit field here ⇒ cache_hit_tokens None.
             ..Default::default()
         })
     );
@@ -93,9 +95,8 @@ fn usage_anthropic_cumulative_last_wins() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(40),     // single input_tokens occurrence
-            completion_tokens: Some(12), // last-wins: 12, NOT 1+5+12=18
-            total_tokens: Some(52),      // computed: 40 + 12
+            tokens_in: Some(40),  // single input_tokens occurrence
+            tokens_out: Some(12), // last-wins: 12, NOT 1+5+12=18
             ..Default::default()
         })
     );
@@ -111,9 +112,8 @@ fn usage_done_marker() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(1),
-            completion_tokens: Some(1),
-            total_tokens: Some(2),
+            tokens_in: Some(1),
+            tokens_out: Some(1),
             ..Default::default()
         })
     );
@@ -132,9 +132,8 @@ fn usage_cross_chunk_boundary() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(9),
-            completion_tokens: Some(1),
-            total_tokens: Some(10),
+            tokens_in: Some(9),
+            tokens_out: Some(1),
             ..Default::default()
         })
     );
@@ -149,9 +148,8 @@ fn usage_non_stream_json() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(7),
-            completion_tokens: Some(14),
-            total_tokens: Some(21),
+            tokens_in: Some(7),
+            tokens_out: Some(14),
             ..Default::default()
         })
     );
@@ -167,21 +165,21 @@ fn usage_schema_dispatch_by_provider() {
     let mut oai = UsageScanner::new(ProviderKind::OpenAi);
     oai.scan_chunk(payload);
     let oai_usage = oai.finalize().expect("openai usage");
-    // OpenAI prefers prompt_tokens.
-    assert_eq!(oai_usage.prompt_tokens, Some(7));
+    // OpenAI prefers prompt_tokens → tokens_in.
+    assert_eq!(oai_usage.tokens_in, Some(7));
 
     let mut ant = UsageScanner::new(ProviderKind::Anthropic);
     ant.scan_chunk(payload);
     let ant_usage = ant.finalize().expect("anthropic usage");
     // Anthropic reads input_tokens/output_tokens.
-    assert_eq!(ant_usage.prompt_tokens, Some(99));
-    assert_eq!(ant_usage.completion_tokens, Some(5));
+    assert_eq!(ant_usage.tokens_in, Some(99));
+    assert_eq!(ant_usage.tokens_out, Some(5));
 
     // Generic falls back to OpenAI-style field names.
     let mut generic = UsageScanner::new(ProviderKind::Generic);
     generic.scan_chunk(payload);
     let generic_usage = generic.finalize().expect("generic usage");
-    assert_eq!(generic_usage.prompt_tokens, Some(7));
+    assert_eq!(generic_usage.tokens_in, Some(7));
 }
 
 // T5.18 — malformed JSON containing `"usage"` is skipped without panicking.
@@ -204,9 +202,8 @@ fn usage_malformed_chunk_skipped() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(2),
-            completion_tokens: Some(2),
-            total_tokens: Some(4),
+            tokens_in: Some(2),
+            tokens_out: Some(2),
             ..Default::default()
         })
     );
@@ -224,7 +221,7 @@ fn usage_openai_no_include_usage() {
     assert_eq!(scanner.finalize(), None);
 }
 
-// T5.20 — OpenAI `usage.prompt_tokens_details.cached_tokens` ⇒ cached_tokens.
+// T5.20 — OpenAI `usage.prompt_tokens_details.cached_tokens` ⇒ cache_hit_tokens.
 #[test]
 fn usage_openai_cached_tokens_from_details() {
     let mut scanner = UsageScanner::new(ProviderKind::OpenAi);
@@ -233,25 +230,24 @@ fn usage_openai_cached_tokens_from_details() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(100),
-            completion_tokens: Some(50),
-            total_tokens: Some(150),
-            cached_tokens: Some(42),
+            tokens_in: Some(100),
+            tokens_out: Some(50),
+            cache_hit_tokens: Some(42),
         })
     );
 }
 
-// T5.20b — OpenAI usage WITHOUT `prompt_tokens_details` ⇒ cached_tokens None.
+// T5.20b — OpenAI usage WITHOUT `prompt_tokens_details` ⇒ cache_hit_tokens None.
 #[test]
 fn usage_openai_no_details_cached_tokens_none() {
     let mut scanner = UsageScanner::new(ProviderKind::OpenAi);
     let chunk = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":50,\"total_tokens\":150}}\n";
     scanner.scan_chunk(chunk);
     let u = scanner.finalize().expect("usage");
-    assert_eq!(u.cached_tokens, None);
+    assert_eq!(u.cache_hit_tokens, None);
 }
 
-// T5.20c — Anthropic `cache_read_input_tokens` ⇒ cached_tokens.
+// T5.20c — Anthropic `cache_read_input_tokens` ⇒ cache_hit_tokens.
 #[test]
 fn usage_anthropic_cached_tokens() {
     let mut scanner = UsageScanner::new(ProviderKind::Anthropic);
@@ -260,10 +256,9 @@ fn usage_anthropic_cached_tokens() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(120),
-            completion_tokens: Some(30),
-            total_tokens: Some(150),
-            cached_tokens: Some(77),
+            tokens_in: Some(120),
+            tokens_out: Some(30),
+            cache_hit_tokens: Some(77),
         })
     );
 }
@@ -275,7 +270,7 @@ fn usage_generic_top_level_cached_tokens() {
     let chunk = b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"cached_tokens\":8}}\n";
     scanner.scan_chunk(chunk);
     let u = scanner.finalize().expect("generic usage");
-    assert_eq!(u.cached_tokens, Some(8));
+    assert_eq!(u.cache_hit_tokens, Some(8));
 }
 
 // T5.20e — OpenAI details present but `cached_tokens` key absent ⇒ None.
@@ -286,7 +281,7 @@ fn usage_openai_details_without_cached_field() {
     let chunk = b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"total_tokens\":5,\"prompt_tokens_details\":{\"audio_tokens\":1}}}\n";
     scanner.scan_chunk(chunk);
     let u = scanner.finalize().expect("usage");
-    assert_eq!(u.cached_tokens, None);
+    assert_eq!(u.cache_hit_tokens, None);
 }
 
 // ===========================================================================
@@ -319,10 +314,9 @@ fn usage_anthropic_coalesced_in_one_chunk() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(42),     // input_tokens from message_start
-            completion_tokens: Some(13), // output_tokens: last-wins (13, not 1)
-            total_tokens: Some(55),      // computed: 42 + 13
-            cached_tokens: Some(7),      // cache_read_input_tokens from message_delta
+            tokens_in: Some(42),       // input_tokens from message_start
+            tokens_out: Some(13),      // output_tokens: last-wins (13, not 1)
+            cache_hit_tokens: Some(7), // cache_read_input_tokens from message_delta
         })
     );
 }
@@ -351,10 +345,9 @@ fn usage_anthropic_separate_chunks() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(42),
-            completion_tokens: Some(13),
-            total_tokens: Some(55),
-            cached_tokens: Some(7),
+            tokens_in: Some(42),
+            tokens_out: Some(13),
+            cache_hit_tokens: Some(7),
         })
     );
 }
@@ -369,9 +362,8 @@ fn usage_openai_single_chunk_unchanged() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(10),
-            completion_tokens: Some(5),
-            total_tokens: Some(15),
+            tokens_in: Some(10),
+            tokens_out: Some(5),
             ..Default::default()
         })
     );
@@ -401,10 +393,9 @@ fn usage_anthropic_split_across_chunks() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(42),
-            completion_tokens: Some(13),
-            total_tokens: Some(55),
-            cached_tokens: Some(7),
+            tokens_in: Some(42),
+            tokens_out: Some(13),
+            cache_hit_tokens: Some(7),
         })
     );
 }
@@ -427,9 +418,8 @@ fn usage_openai_split_across_chunks_no_double_count() {
     assert_eq!(
         scanner.finalize(),
         Some(Usage {
-            prompt_tokens: Some(10),
-            completion_tokens: Some(5),
-            total_tokens: Some(15),
+            tokens_in: Some(10),
+            tokens_out: Some(5),
             ..Default::default()
         })
     );

@@ -17,7 +17,7 @@
 //! - The failover loop advances to the next candidate on a provider failure
 //!   and the breaker records the failure.
 //! - The breaker records a success on a 2xx.
-//! - Usage (`prompt_tokens`/`completion_tokens`/`total_tokens`) is extracted
+//! - Usage (`tokens_in`/`tokens_out`/`cache_hit_tokens`) is extracted
 //!   from the streamed response.
 //! - Error codes surface correctly: 404 (model not found), 401 (auth denied),
 //!   429 (rate limited), 503 (no provider), 502 (all providers failed).
@@ -714,9 +714,9 @@ async fn usage_tokens_extracted_from_response() {
     let records = recording.records();
     assert_eq!(records.len(), 1, "exactly one usage record expected");
     let r = &records[0];
-    assert_eq!(r.prompt_tokens, Some(13));
-    assert_eq!(r.completion_tokens, Some(7));
-    assert_eq!(r.total_tokens, Some(20));
+    assert_eq!(r.tokens_in, Some(13));
+    assert_eq!(r.tokens_out, Some(7));
+    assert_eq!(r.cache_hit_tokens, None);
     assert_eq!(r.provider_id, "p1");
     assert_eq!(r.model_key, "gpt-4");
     assert_eq!(r.status_code, 200);

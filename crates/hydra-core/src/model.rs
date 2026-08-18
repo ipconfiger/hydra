@@ -173,21 +173,31 @@ pub enum ProviderKind {
     Generic,
 }
 
-/// Normalised token usage. All fields optional: some providers omit them
-/// (e.g. OpenAI without `stream_options.include_usage`).
+/// Normalised, provider-neutral token usage. All fields optional: some
+/// providers omit them (e.g. OpenAI without `stream_options.include_usage`).
 ///
-/// `cached_tokens` captures prompt-cache hits: OpenAI exposes it as
-/// `usage.prompt_tokens_details.cached_tokens`, Anthropic as
-/// `usage.cache_read_input_tokens`. `None` when the provider does not report
-/// it (so the dimension is simply absent, not zero).
+/// Field names are deliberately neutral (not OpenAI/Anthropic-flavoured) so
+/// the metering table has one stable schema regardless of upstream:
+///
+/// - `tokens_in` — tokens SENT in the request (all input, cache hits
+///   included). Maps from OpenAI `prompt_tokens` / Anthropic `input_tokens`.
+/// - `tokens_out` — tokens RETURNED by the model. Maps from OpenAI
+///   `completion_tokens` / Anthropic `output_tokens`.
+/// - `cache_hit_tokens` — tokens in the request that hit the prompt cache; a
+///   SUBSET of `tokens_in`. Maps from OpenAI
+///   `prompt_tokens_details.cached_tokens` / Anthropic
+///   `cache_read_input_tokens`. `None` when the provider does not report it
+///   (the dimension is simply absent, not zero).
+///
+/// There is deliberately NO `total_tokens` field: it is derivable
+/// (`tokens_in + tokens_out`) and carries no billing meaning.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
-    pub prompt_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
-    /// Prompt-cache hit token count (OpenAI `cached_tokens` /
-    /// Anthropic `cache_read_input_tokens`). `None` when unreported.
-    pub cached_tokens: Option<u64>,
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
+    /// Prompt-cache hit token count (subset of `tokens_in`). `None` when
+    /// unreported.
+    pub cache_hit_tokens: Option<u64>,
 }
 
 /// A persisted usage record (design §9.1). `created_at` is ISO-8601 text
@@ -208,11 +218,13 @@ pub struct UsageRecord {
     pub model_key: String,
     pub client_api_key_masked: Option<String>,
     pub status_code: u16,
-    pub prompt_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
-    /// Prompt-cache hit tokens (mirrors [`Usage::cached_tokens`]).
-    pub cached_tokens: Option<u64>,
+    /// Tokens sent in the request (all input, cache hits included).
+    pub tokens_in: Option<u64>,
+    /// Tokens returned by the model.
+    pub tokens_out: Option<u64>,
+    /// Prompt-cache hit tokens (subset of `tokens_in`; mirrors
+    /// [`Usage::cache_hit_tokens`]).
+    pub cache_hit_tokens: Option<u64>,
     pub latency_ms: u64,
     /// Hydra overhead: request start → just before upstream send.
     pub forward_latency_ms: Option<u64>,

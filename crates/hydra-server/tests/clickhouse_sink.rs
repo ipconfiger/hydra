@@ -23,10 +23,9 @@ fn sample() -> UsageRecord {
         model_key: "gpt-test".to_string(),
         client_api_key_masked: None,
         status_code: 200,
-        prompt_tokens: Some(12),
-        completion_tokens: Some(34),
-        total_tokens: Some(46),
-        cached_tokens: Some(5),
+        tokens_in: Some(12),
+        tokens_out: Some(34),
+        cache_hit_tokens: Some(5),
         latency_ms: 250,
         forward_latency_ms: Some(8),
         ttft_ms: Some(180),
@@ -38,17 +37,16 @@ fn sample() -> UsageRecord {
 }
 
 // The `usage_record` columns, in declaration order
-// (migrations/0001_init.sql + 0002_usage_metrics.sql).
+// (environment/clickhouse/init.sql — provider-neutral token columns).
 const USAGE_COLUMNS: &[&str] = &[
     "tenant_id",
     "provider_id",
     "model_key",
     "client_api_key",
     "status_code",
-    "prompt_tokens",
-    "completion_tokens",
-    "total_tokens",
-    "cached_tokens",
+    "tokens_in",
+    "tokens_out",
+    "cache_hit_tokens",
     "latency_ms",
     "forward_latency_ms",
     "ttft_ms",
@@ -92,13 +90,13 @@ fn clickhouse_json_row_matches_usage_record_schema() {
         "u16 must be a bare number: {json}"
     );
     assert!(
-        json.contains("\"prompt_tokens\":12"),
+        json.contains("\"tokens_in\":12"),
         "Option<u64>::Some must be a bare number: {json}"
     );
     // New metrics dimensions are bare numbers (Some) — not quoted, not null.
     assert!(
-        json.contains("\"cached_tokens\":5"),
-        "cached_tokens Some must be a bare number: {json}"
+        json.contains("\"cache_hit_tokens\":5"),
+        "cache_hit_tokens Some must be a bare number: {json}"
     );
     assert!(
         json.contains("\"forward_latency_ms\":8"),
@@ -117,13 +115,13 @@ fn clickhouse_json_row_matches_usage_record_schema() {
 #[test]
 fn clickhouse_json_row_new_metrics_null_when_absent() {
     let mut r = sample();
-    r.cached_tokens = None;
+    r.cache_hit_tokens = None;
     r.forward_latency_ms = None;
     r.ttft_ms = None;
     let json = build_clickhouse_json_row(&r);
     assert!(
-        json.contains("\"cached_tokens\":null"),
-        "cached_tokens None must be null: {json}"
+        json.contains("\"cache_hit_tokens\":null"),
+        "cache_hit_tokens None must be null: {json}"
     );
     assert!(
         json.contains("\"forward_latency_ms\":null"),

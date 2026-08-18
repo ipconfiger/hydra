@@ -119,19 +119,12 @@ impl UsageScanner {
     }
 
     /// Consume the scanner and return the final accumulated usage, if any was
-    /// observed. Computes `total_tokens` from `prompt + completion` when the
-    /// provider omitted it (e.g. Anthropic, which has no `total_tokens` field).
-    pub fn finalize(mut self) -> Option<Usage> {
+    /// observed. Fields are the neutral [`Usage`] names (tokens_in /
+    /// cache_hit_tokens / tokens_out); there is deliberately no
+    /// derived `total_tokens`.
+    pub fn finalize(self) -> Option<Usage> {
         if !self.seen_any {
             return None;
-        }
-        if self.usage.total_tokens.is_none()
-            && self.usage.prompt_tokens.is_some()
-            && self.usage.completion_tokens.is_some()
-        {
-            self.usage.total_tokens = Some(
-                self.usage.prompt_tokens.unwrap_or(0) + self.usage.completion_tokens.unwrap_or(0),
-            );
         }
         Some(self.usage)
     }
@@ -147,10 +140,9 @@ impl UsageScanner {
                 let Ok(u) = serde_json::from_slice::<OpenAiUsageFields>(json) else {
                     return false;
                 };
-                self.usage.prompt_tokens = u.prompt_tokens.or(u.input_tokens);
-                self.usage.completion_tokens = u.completion_tokens.or(u.output_tokens);
-                self.usage.total_tokens = u.total_tokens;
-                self.usage.cached_tokens = u
+                self.usage.tokens_in = u.prompt_tokens.or(u.input_tokens);
+                self.usage.tokens_out = u.completion_tokens.or(u.output_tokens);
+                self.usage.cache_hit_tokens = u
                     .prompt_tokens_details
                     .and_then(|d| d.cached_tokens)
                     .or(u.cached_tokens);
@@ -168,13 +160,13 @@ impl UsageScanner {
                     return false;
                 };
                 if let Some(v) = u.input_tokens {
-                    self.usage.prompt_tokens = Some(v);
+                    self.usage.tokens_in = Some(v);
                 }
                 if let Some(v) = u.output_tokens {
-                    self.usage.completion_tokens = Some(v);
+                    self.usage.tokens_out = Some(v);
                 }
                 if let Some(v) = u.cache_read_input_tokens {
-                    self.usage.cached_tokens = Some(v);
+                    self.usage.cache_hit_tokens = Some(v);
                 }
                 self.seen_any = true;
                 true
@@ -318,7 +310,6 @@ fn extract_usage_object(buf: &[u8]) -> Option<&[u8]> {
 struct OpenAiUsageFields {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
-    total_tokens: Option<u64>,
     /// Generic-provider fallback field name.
     input_tokens: Option<u64>,
     /// Generic-provider fallback field name.

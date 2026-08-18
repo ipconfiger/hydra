@@ -320,7 +320,15 @@ CREATE TABLE limit_role (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- 用量记录（默认 SQLite Sink）
+-- 用量记录（默认 SQLite Sink）。token 列为 provider-中性命名（§9.5）：
+--   tokens_in        请求发送的 token 数（含缓存命中；OpenAI prompt_tokens /
+--                    Anthropic input_tokens）
+--   tokens_out       模型返回的 token 数（OpenAI completion_tokens /
+--                    Anthropic output_tokens）
+--   cache_hit_tokens 命中缓存的 token 数，⊆ tokens_in（OpenAI
+--                    prompt_tokens_details.cached_tokens / Anthropic
+--                    cache_read_input_tokens）
+-- 不存 total_tokens：它是派生值（tokens_in + tokens_out），无计费意义。
 CREATE TABLE usage_record (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     tenant_id         TEXT NOT NULL,
@@ -328,10 +336,12 @@ CREATE TABLE usage_record (
     model_key         TEXT NOT NULL,
     client_api_key    TEXT,                 -- 脱敏后的客户端 key（见 §9.5）
     status_code       INTEGER NOT NULL,
-    prompt_tokens     INTEGER,
-    completion_tokens INTEGER,
-    total_tokens      INTEGER,
+    tokens_in         INTEGER,
+    tokens_out        INTEGER,
+    cache_hit_tokens  INTEGER,
     latency_ms        INTEGER NOT NULL,
+    forward_latency_ms INTEGER,
+    ttft_ms           INTEGER,
     upstream_host     TEXT,
     error             TEXT,
     created_at        TEXT NOT NULL DEFAULT (datetime('now'))
@@ -855,9 +865,9 @@ pub struct UsageRecord {
     pub model_key: String,
     pub client_api_key_masked: Option<String>,   // 见 §9.5 脱敏
     pub status_code: u16,
-    pub prompt_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
+    pub tokens_in: Option<u64>,          // 请求发送的 token 数（含缓存命中）
+    pub tokens_out: Option<u64>,         // 模型返回的 token 数
+    pub cache_hit_tokens: Option<u64>,   // 命中缓存的 token 数（⊆ tokens_in）
     pub latency_ms: u64,
     pub upstream_host: Option<String>,
     pub error: Option<String>,
@@ -865,6 +875,9 @@ pub struct UsageRecord {
     pub created_at: DateTime<Utc>,
 }
 ```
+
+> **token 字段为 provider-中性命名**（§9.5）：不存 `total_tokens`——它是派生值
+> （`tokens_in + tokens_out`），无计费意义。
 
 ### 9.2 默认实现：`SqliteSink`
 
@@ -887,21 +900,21 @@ pub struct UsageRecord {
 - **命中时**：从该 chunk 抽取 `data: ` 行的 JSON 切片（`memchr` 定位边界，返回 `&[u8]` 借用零拷贝），**仅**对该 ~50 字节做一次 `serde_json::from_slice` 提取用量；
 - **跨 chunk 边界**：`"usage"` 可能被拆在两个 chunk → 维护尾部小缓冲（仅当扫描到不完整 `data:` 行时拼接，常态零分配）。
 
-**多 provider schema**（命中后按 schema 归一）：
+**多 provider schema**（命中后按 schema 归一为中性字段 tokens_in / cache_hit_tokens / tokens_out）：
 
 | Provider | 流式 usage 位置 | 字段 |
 | --- | --- | --- |
-| OpenAI 兼容 | 末尾 chunk 的 `usage`（需 `stream_options.include_usage`） | `prompt_tokens / completion_tokens / total_tokens` |
-| Anthropic | `event: message_delta` 的 `usage` | `input_tokens / output_tokens`（累计需累加增量） |
-| 通用 JSON | `"usage"` 兜底 | 归一为 prompt/completion/total |
+| OpenAI 兼容 | 末尾 chunk 的 `usage`（需 `stream_options.include_usage`） | `prompt_tokens / completion_tokens / prompt_tokens_details.cached_tokens` |
+| Anthropic | `event: message_delta` 的 `usage` | `input_tokens / output_tokens / cache_read_input_tokens`（累计需累加增量） |
+| 通用 JSON | `"usage"` 兜底 | 归一为 tokens_in/tokens_out/cache_hit_tokens |
 
-- 归一：`prompt = usage.prompt_tokens ?? usage.input_tokens`；`completion = usage.completion_tokens ?? usage.output_tokens`；`total = usage.total_tokens ?? (prompt+completion)`；
+- 归一：`tokens_in = usage.prompt_tokens ?? usage.input_tokens`；`tokens_out = usage.completion_tokens ?? usage.output_tokens`；`cache_hit_tokens = usage.prompt_tokens_details.cached_tokens ?? usage.cache_read_input_tokens ?? usage.cached_tokens`；**不计算 total**；
 - `data: [DONE]` 终止：`memchr` 扫描即可识别；
 - 非流式 JSON：逐 chunk 累积进 `ctx.json_buf`，`end_of_stream` 时**一次** `memchr` + 反序列化；
 - schema 由 `selected.provider` 推断（路由时记入 CTX），scanner 按之选归一分支；
 - **纯函数测试**（W1）：喂入构造的 SSE 字节序列，断言扫描命中/跨边界/未命中/`[DONE]` 行为，零 IO、零 mock。
 
-> **已知限制**：部分 provider 流式不返回 usage（如未设 `include_usage`）。此时 `total_tokens` 为 `None`，限流 token 维度对本次请求不计；记录中标注 `tokens=null`。
+> **已知限制**：部分 provider 流式不返回 usage（如未设 `include_usage`）。此时三个 token 字段均为 `None`，限流 token 维度对本次请求不计；记录中标注 `tokens=null`。
 
 ### 9.5 脱敏
 
