@@ -346,6 +346,7 @@ async fn auth_request_contract() {
     // body JSON
     let body = String::from_utf8_lossy(&req.body);
     assert!(body.contains("\"api_key\":\"sk-contract\""), "body: {body}");
+    assert!(body.contains("\"key\":\"sk-contract\""), "body: {body}");
     assert!(body.contains("\"tenant_id\":\"t1\""), "body: {body}");
 }
 
@@ -566,4 +567,105 @@ async fn fail_open_on_connection_refused() {
         }
     );
     assert_eq!(checker.cache().len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Dogress `/auth/api_key` contract (crates/api AuthApiKeyResponse): the
+// service ALWAYS answers HTTP 200 and flags denials in the body as
+// `{"status":false}`. The checker must read the body, not the status code.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auth_upstream_200_body_status_false_denies_cached() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"status\":false,\"reason\":\"invalid_key\"}",
+            "application/json",
+        ))
+        .expect(1) // denial is cached: second call MUST hit the cache
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+
+    let v1 = checker.check(&tenant, "sh-bad").await;
+    assert_eq!(
+        v1,
+        AuthVerdict::Denied {
+            status: 401,
+            reason: "denied",
+            source: CacheSource::Miss
+        }
+    );
+
+    let v2 = checker.check(&tenant, "sh-bad").await;
+    assert_eq!(
+        v2,
+        AuthVerdict::Denied {
+            status: 401,
+            reason: "denied",
+            source: CacheSource::Hit
+        }
+    );
+    assert_eq!(checker.cache().len(), 1);
+}
+
+#[tokio::test]
+async fn auth_upstream_200_body_status_true_allows_cached() {
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"status\":true,\"reason\":\"\",\"user_id\":42}",
+            "application/json",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+
+    let v1 = checker.check(&tenant, "sh-good").await;
+    assert_eq!(
+        v1,
+        AuthVerdict::Allowed {
+            source: CacheSource::Miss
+        }
+    );
+    let v2 = checker.check(&tenant, "sh-good").await;
+    assert_eq!(
+        v2,
+        AuthVerdict::Allowed {
+            source: CacheSource::Hit
+        }
+    );
+}
+
+#[tokio::test]
+async fn auth_upstream_200_body_design_allowed_false_denies() {
+    // design §11.3 optional refinement: `{"allowed":false}` on a 2xx is a
+    // denial too (mock tenant / §11.3-style services use this shape).
+    let (server, checker) = setup(FailMode::Closed, SHORT_TIMEOUT).await;
+    Mock::given(method("POST"))
+        .and(path("/auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"allowed\":false,\"reason\":\"blocked\"}",
+            "application/json",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tenant = tenant_at(&server.uri());
+    let v = checker.check(&tenant, "sk-blocked").await;
+    assert_eq!(
+        v,
+        AuthVerdict::Denied {
+            status: 401,
+            reason: "denied",
+            source: CacheSource::Miss
+        }
+    );
 }

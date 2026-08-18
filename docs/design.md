@@ -1005,20 +1005,27 @@ Authorization: Bearer <client_api_key>
 X-Hydra-Tenant: <tenant_id>
 X-Hydra-Trace-Id: <trace_id>
 
-{"api_key": "<client_api_key>", "tenant_id": "<tenant_id>"}
+{"api_key": "<client_api_key>", "key": "<client_api_key>", "tenant_id": "<tenant_id>"}
 ```
 
 - `api_key` 同时放入 `Authorization` 头与 JSON body，租户侧可任选一种读取；
+- `key` 为 **Dogress `crates/api` `/auth/api_key`（`AuthApiKeyRequest`）的字段名别名**，与 `api_key` 同值；双方服务均忽略未知 JSON 字段，超集 body 对 §11.3 契约与 Dogress 契约同时成立；
 - `tenant_id`、`trace_id` 便于租户侧日志关联与多租户路由；
-- **不含 model**：认证先于 body 解析，此时 model 未知；额度/模型限制由租户系统按其自身规则决定。
+- **不含 model**：认证先于 body 解析，此时 model 未知；额度/模型限制由租户系统按其自身规则决定（Dogress 侧 `model_name` 为可选字段，缺省按全部套餐检查）。
 
 **响应**（auth_url → Hydra）：
 
 | HTTP 状态 | 含义 | Hydra 动作 |
 | --- | --- | --- |
-| `200` | 允许 | 写缓存 `allowed=true`（默认 5min），放行 |
+| `200` | 允许/拒绝由响应体判定 | 见下方「响应体判定」；写缓存后放行或拒绝 |
 | `401` / `403` | 拒绝 | 写缓存 `allowed=false`（默认 deny_ttl），返回 401 |
 | 其他 / 超时 / 连接错 | 服务异常 | 按策略（见 §11.4） |
+
+**响应体判定（2xx 时 Hydra 读取 body）**：
+
+- **`{"status": false}`**（Dogress `AuthApiKeyResponse.status`）→ 拒绝：写缓存 `allowed=false`（deny_ttl），返回 401。Dogress 认证服务**恒返回 HTTP 200**，拒绝仅通过 `status` 字段表达，必须读 body 而非仅看状态码；
+- **`{"allowed": false}`**（本契约可选细化）→ 同样视为拒绝；
+- 其余 2xx body（`{"status":true}`、`{"allowed":true,...}`、空、不可解析）→ 允许。
 
 **可选精细化响应体**（租户侧可选返回，Hydra 向后兼容）：
 
@@ -1030,7 +1037,7 @@ X-Hydra-Trace-Id: <trace_id>
 }
 ```
 
-> 2xx 且 `allowed=false` 视为拒绝；非 2xx 但带合法 JSON 也以 `allowed` 字段为准；解析失败退回按 HTTP 状态判定。
+> 2xx 且 `status=false` 或 `allowed=false` 视为拒绝；非 2xx 但带合法 JSON 也以 `status`/`allowed` 字段为准；解析失败退回按 HTTP 状态判定。
 
 ### 11.4 `auth_url` 不可用 / 超时的策略
 

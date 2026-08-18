@@ -366,14 +366,31 @@ impl AuthChecker for HttpAuthChecker {
             let op = apply_upstream(status, allow_ttl, deny_ttl);
             match op {
                 CacheOp::Set { allowed: true, ttl } => {
-                    // 2xx allow: optional `expires_in` in the body overrides
-                    // the default allow TTL (design §11.3).
-                    let effective_ttl = match resp.text().await {
-                        Ok(text) => parse_expires_in(&text)
-                            .map(Duration::from_secs)
-                            .unwrap_or(ttl),
-                        Err(_) => ttl,
+                    // 2xx allow — but the decision may live in the body: the
+                    // Dogress tenant auth service (`crates/api` `/auth/api_key`,
+                    // `AuthApiKeyResponse`) ALWAYS answers HTTP 200 and flags
+                    // denials as `{"status":false}`; design §11.3 likewise
+                    // allows `{"allowed":false}`. An explicit false flag is a
+                    // denial (cached with deny_ttl); any other 2xx body —
+                    // `{"status":true}`, `{"allowed":true,"expires_in":60}`,
+                    // empty, unparseable — stays an allow.
+                    let text = match resp.text().await {
+                        Ok(t) => t,
+                        Err(_) => String::new(),
                     };
+                    if body_says_denied(&text) {
+                        cache.set(&tenant_id, &api_key_owned, false, deny_ttl);
+                        return AuthVerdict::Denied {
+                            status: 401,
+                            reason: "denied",
+                            source: CacheSource::Miss,
+                        };
+                    }
+                    // optional `expires_in` overrides the default allow TTL
+                    // (design §11.3).
+                    let effective_ttl = parse_expires_in(&text)
+                        .map(Duration::from_secs)
+                        .unwrap_or(ttl);
                     cache.set(&tenant_id, &api_key_owned, true, effective_ttl);
                     decide(Verdict::Miss, 401, "denied") // → Allowed{Miss}
                 }
@@ -453,11 +470,17 @@ fn json_escape_into(out: &mut String, s: &str) {
     }
 }
 
-/// Build the auth request JSON body (design §11.3):
-/// `{"api_key":"<api_key>","tenant_id":"<tenant_id>"}`.
+/// Build the auth request JSON body: design §11.3
+/// `{"api_key":"<api_key>","tenant_id":"<tenant_id>"}` plus the Dogress
+/// `crates/api` `AuthApiKeyRequest` alias `"key":"<api_key>"`. Both sides
+/// ignore unknown JSON fields, so the superset body satisfies both contracts:
+/// the mock tenant / §11.3 readers use `api_key`, the Dogress `/auth/api_key`
+/// handler reads `key`.
 fn auth_request_body(api_key: &str, tenant_id: &str) -> String {
-    let mut out = String::with_capacity(api_key.len() + tenant_id.len() + 32);
+    let mut out = String::with_capacity(api_key.len() * 2 + tenant_id.len() + 48);
     out.push_str("{\"api_key\":\"");
+    json_escape_into(&mut out, api_key);
+    out.push_str("\",\"key\":\"");
     json_escape_into(&mut out, api_key);
     out.push_str("\",\"tenant_id\":\"");
     json_escape_into(&mut out, tenant_id);
@@ -482,6 +505,33 @@ fn parse_expires_in(body: &str) -> Option<u64> {
     } else {
         digits.parse().ok()
     }
+}
+
+/// Whether a 2xx auth response body carries an explicit denial flag:
+/// `{"status":false}` (Dogress `crates/api` `AuthApiKeyResponse.status`) or
+/// `{"allowed":false}` (design §11.3 optional refinement). Any other body —
+/// `{"status":true}`, `{"allowed":true,...}`, empty, or unparseable — stays
+/// an allow. Tiny scans in the style of [`parse_expires_in`]: both flags are
+/// flat top-level JSON booleans when present, so a false positive on nested /
+/// string occurrences is structurally impossible for the response shapes both
+/// contracts use.
+fn body_says_denied(body: &str) -> bool {
+    const STATUS: &str = "\"status\"";
+    const ALLOWED: &str = "\"allowed\"";
+    json_field_is_false(body, STATUS) || json_field_is_false(body, ALLOWED)
+}
+
+/// Scan `body` for a top-level JSON boolean field `<field>: false`
+/// (whitespace tolerant; `<field>` must be the quoted key, e.g. `"\"status\""`).
+fn json_field_is_false(body: &str, field: &str) -> bool {
+    let Some((_, rest)) = body.split_once(field) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(rest) = rest.strip_prefix(':') else {
+        return false;
+    };
+    rest.trim_start().starts_with("false")
 }
 
 /// Generate a per-request trace id (dependency-free). W4 may instead inject
@@ -511,6 +561,7 @@ mod tests {
     fn request_body_contains_fields() {
         let body = auth_request_body("sk-test", "t1");
         assert!(body.contains("\"api_key\":\"sk-test\""));
+        assert!(body.contains("\"key\":\"sk-test\""));
         assert!(body.contains("\"tenant_id\":\"t1\""));
     }
 
@@ -519,6 +570,35 @@ mod tests {
         let body = auth_request_body("sk-\"evil", "t1");
         // the embedded quote must be escaped, not terminate the string early
         assert!(body.contains("\"api_key\":\"sk-\\\"evil\""));
+        assert!(body.contains("\"key\":\"sk-\\\"evil\""));
+    }
+
+    #[test]
+    fn body_says_denied_dogress_status_false() {
+        assert!(body_says_denied(
+            "{\"status\":false,\"reason\":\"invalid_key\"}"
+        ));
+        assert!(body_says_denied("{ \"status\" : false }"));
+    }
+
+    #[test]
+    fn body_says_denied_design_allowed_false() {
+        assert!(body_says_denied(
+            "{\"allowed\":false,\"reason\":\"blocked\"}"
+        ));
+    }
+
+    #[test]
+    fn body_says_denied_true_or_absent() {
+        assert!(!body_says_denied("{\"status\":true,\"reason\":\"\"}"));
+        assert!(!body_says_denied("{\"allowed\":true,\"expires_in\":300}"));
+        assert!(!body_says_denied("{\"allowed\":true,\"status\":true}"));
+        assert!(!body_says_denied(""));
+        assert!(!body_says_denied("not json"));
+        // `false` inside a string value must NOT count as a denial
+        assert!(!body_says_denied("{\"reason\":\"status is false\"}"));
+        // `"status":"false"` (string, not boolean) must NOT count either
+        assert!(!body_says_denied("{\"status\":\"false\"}"));
     }
 
     #[test]
