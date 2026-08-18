@@ -84,7 +84,12 @@ tls-openssl = ["proxy", "pingora-core?/openssl", "pingora?/openssl", "pingora-pr
 server = ["db", "http-client", "proxy", "tls-boringssl"]
 
 # Optional usage sink (design §9.3). Off by default.
-usage-clickhouse = ["dep:clickhouse"]
+# Zero-dependency: the sink talks to ClickHouse over its native HTTP interface
+# (INSERT … FORMAT JSONEachRow) and never uses the `clickhouse` crate (the 0.1
+# placeholder pin was a W1 leftover — see sink.rs module docs). Compiling the
+# feature adds BOTH sinks (sqlite + clickhouse) to one binary; the active one
+# is chosen at runtime by HYDRA_USAGE_SINK.
+usage-clickhouse = []
 
 [dependencies]
 # Always link the pure core.
@@ -121,7 +126,8 @@ aes-gcm = { version = "0.10", optional = true }
 base64 = { version = "0.22", optional = true }
 
 # --- Optional sink --------------------------------------------------------
-clickhouse = { version = "0.1", optional = true }
+# (no extra dependency: the ClickHouse sink uses tokio's HTTP primitives only,
+# see the `usage-clickhouse` feature comment above)
 
 [dev-dependencies]
 wiremock = "0.6"

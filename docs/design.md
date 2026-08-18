@@ -874,10 +874,10 @@ pub struct UsageRecord {
 
 ### 9.3 可选实现：`ClickHouseSink`（feature flag）
 
-- `Cargo.toml` feature `usage-clickhouse`；
-- 配置 `USAGE_CLICKHOUSE_URL`；
+- `Cargo.toml` feature `usage-clickhouse`（**零额外依赖**：sink 走 ClickHouse 原生 HTTP 接口 `INSERT … FORMAT JSONEachRow`，不使用 `clickhouse` crate）；
+- 配置 `HYDRA_CLICKHOUSE_URL`（**URL 不支持凭据**，需指向匿名实例）；
 - 同样经 channel 异步批量写入；
-- 二者实现同一 `UsageSink` trait，启动按配置选择。
+- 二者实现同一 `UsageSink` trait，启动按配置选择。**feature 开启时同一二进制内同时编译 `SqliteSink` 与 `ClickHouseSink`**，运行时由 `HYDRA_USAGE_SINK=sqlite|clickhouse` 切换，无需重编。
 
 ### 9.4 用量解析（零拷贝 memchr 扫描 + 多 provider schema）
 

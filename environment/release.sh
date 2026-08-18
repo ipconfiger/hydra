@@ -23,10 +23,12 @@ BIN_NAME="hydra"
 PKG_DIR="crates/hydra-server"
 STAGE_DIR="$ROOT/environment/bin"
 
-echo ">> [1/2] building $BIN_NAME (release, --features server) from $PKG_DIR..."
-# Run from the package dir so `--features server --bin hydra` resolves for the
-# [[bin]] hydra target (required-features = ["server"]), matching build.sh.
-( cd "$PKG_DIR" && cargo build --release --features server --bin "$BIN_NAME" )
+echo ">> [1/2] building $BIN_NAME (release, --features server,usage-clickhouse) from $PKG_DIR..."
+# Run from the package dir so `--features server,usage-clickhouse --bin hydra`
+# resolves for the [[bin]] hydra target (required-features = ["server"]),
+# matching build.sh. usage-clickhouse compiles BOTH sinks (sqlite + clickhouse)
+# into one binary; HYDRA_USAGE_SINK=sqlite|clickhouse selects at runtime.
+( cd "$PKG_DIR" && cargo build --release --features server,usage-clickhouse --bin "$BIN_NAME" )
 
 SRC="$ROOT/target/release/$BIN_NAME"
 if [[ ! -f "$SRC" ]]; then

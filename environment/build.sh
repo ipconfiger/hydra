@@ -27,8 +27,10 @@ DO_DOCKER=1
 [[ "${1:-}" == "--no-build" ]] && DO_DOCKER=0
 
 echo ">> [1/3] cross-compiling hydra for $TARGET (release) via rust_build_linux..."
-# Run from the package dir so --features server --bin hydra resolves correctly for the cross target.
-( cd crates/hydra-server && rust_build_linux --features server --bin hydra )
+# Run from the package dir so --features server,usage-clickhouse --bin hydra resolves
+# correctly for the cross target. usage-clickhouse compiles BOTH sinks (sqlite +
+# clickhouse) into one binary; HYDRA_USAGE_SINK=sqlite|clickhouse selects at runtime.
+( cd crates/hydra-server && rust_build_linux --features server,usage-clickhouse --bin hydra )
 
 if [[ ! -f "$GLOBAL_TARGET_BIN" ]]; then
     echo "!! expected binary not found at $GLOBAL_TARGET_BIN" >&2
