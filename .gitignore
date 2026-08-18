@@ -36,3 +36,9 @@
 
 # Secrets / certs / sensitive material (never commit)
 /secure/
+
+# Local release script (per-developer convenience wrapper)
+/scripts/local_release.sh
+
+# Locally staged server binary (built by scripts/local_release.sh)
+/environment/bin/
