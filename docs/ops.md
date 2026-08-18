@@ -49,7 +49,7 @@ runtime. The release binary is the only artefact you ship.
 | `HYDRA_LISTEN` | `0.0.0.0:8080` | Proxy listener (TLS when any tenant has certs configured, plain TCP otherwise). |
 | `HYDRA_ADMIN_ADDR` | `127.0.0.1:8081` | Admin REST + UI + `/metrics` listener. **Bind loopback only** (design §13.3). |
 | `HYDRA_USAGE_SINK` | `sqlite` | `sqlite` or `clickhouse`. **Runtime switch — one binary contains BOTH sinks** when built with `--features server,usage-clickhouse` (the release scripts do this), so flipping the sink needs no rebuild. |
-| `HYDRA_CLICKHOUSE_URL` | *(unset)* | ClickHouse HTTP endpoint, e.g. `http://hydra-clickhouse:8123` (required when `HYDRA_USAGE_SINK=clickhouse`). **Credentials are NOT supported in the URL** — point it at an anonymous instance (e.g. a dedicated `hydra-clickhouse` container with `CLICKHOUSE_SKIP_USER_SETUP: 1`). |
+| `HYDRA_CLICKHOUSE_URL` | *(unset)* | ClickHouse HTTP endpoint, e.g. `http://hydra-clickhouse:8123` (required when `HYDRA_USAGE_SINK=clickhouse`). **Credentials ARE supported**: use `http://user:pass@host:8123` (sent as HTTP Basic auth) or query params (`?user=&password=`); other query params like `?database=dogress` are passed through verbatim. |
 | `RUST_LOG` / `HYDRA_LOG` | `info` | `tracing` env filter. |
 
 > The current binary reads the proxy/admin addresses and DB URL from env (the

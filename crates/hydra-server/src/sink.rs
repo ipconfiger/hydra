@@ -305,6 +305,64 @@ use tokio::sync::mpsc as ch_mpsc;
 struct ClickHouseConfig {
     /// `host:port` for the TCP connection (e.g. `127.0.0.1:8123`).
     host_port: String,
+    /// HTTP Basic credentials from `user:pass@host` URL userinfo, if present.
+    /// Sent as `Authorization: Basic <base64(user:pass)>` — ClickHouse's HTTP
+    /// interface accepts Basic auth natively.
+    auth: Option<(String, String)>,
+    /// Any query string from the URL (e.g. `?database=dogress` or
+    /// `?user=x&password=y`), WITHOUT the leading `?`. Appended to the POST
+    /// request's query string; empty when the URL had none.
+    query_params: String,
+}
+
+/// Parse a ClickHouse URL into transport + credentials. Accepted forms:
+///
+/// - `http://host:port` / `https://host:port` / bare `host:port` (anonymous);
+/// - `http://user:pass@host:port` — userinfo becomes HTTP Basic auth;
+/// - any of the above plus a query string (`?database=dogress`,
+///   `?user=x&password=y`), which is passed through verbatim.
+///
+/// CR/LF in credentials are stripped (header-injection guard); the password is
+/// otherwise sent as-is inside the Basic auth header.
+#[cfg(feature = "usage-clickhouse")]
+fn parse_clickhouse_url(url: &str) -> ClickHouseConfig {
+    let stripped = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    // Split off the query string first (kept for passthrough).
+    let (authority, query) = match stripped.split_once('?') {
+        Some((a, q)) => (a, Some(q)),
+        None => (stripped, None),
+    };
+    // Split off userinfo (`user[:pass]@`).
+    let (userinfo, host_port) = match authority.split_once('@') {
+        Some((ui, hp)) => (Some(ui), hp),
+        None => (None, authority),
+    };
+    let auth = userinfo.and_then(|ui| {
+        let (user, pass) = match ui.split_once(':') {
+            Some((u, p)) => (u, p),
+            None => (ui, ""),
+        };
+        if user.is_empty() {
+            None
+        } else {
+            Some((strip_crlf(user), strip_crlf(pass)))
+        }
+    });
+    ClickHouseConfig {
+        // Trim a trailing '/' (and any path): the sink only dials host:port.
+        host_port: host_port.trim_end_matches('/').to_string(),
+        auth,
+        query_params: query.unwrap_or("").to_string(),
+    }
+}
+
+/// Strip CR/LF so user-supplied URL credentials can never inject HTTP headers.
+#[cfg(feature = "usage-clickhouse")]
+fn strip_crlf(s: &str) -> String {
+    s.chars().filter(|&c| c != '\r' && c != '\n').collect()
 }
 
 /// Optional ClickHouse `UsageSink`. Same batching/backoff/Drop semantics as
@@ -395,20 +453,6 @@ fn drain_on_drop(tx: Option<mpsc::Sender<UsageRecord>>, join: Option<tokio::task
     }));
 }
 
-/// Parse a ClickHouse URL into the `host:port` for a TCP connection. Accepts
-/// `http://host:port`, `https://host:port`, or bare `host:port`.
-#[cfg(feature = "usage-clickhouse")]
-fn parse_clickhouse_url(url: &str) -> ClickHouseConfig {
-    let stripped = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
-    let host_port = stripped.split('/').next().unwrap_or(stripped);
-    ClickHouseConfig {
-        host_port: host_port.to_string(),
-    }
-}
-
 /// The `INSERT` statement. Column list matches `usage_record` (§9.5).
 #[cfg(feature = "usage-clickhouse")]
 const CLICKHOUSE_INSERT: &str =
@@ -436,13 +480,32 @@ async fn insert_batch_clickhouse_http(
     }
 
     // POST /?query=<url-encoded INSERT>& … with the rows in the body.
-    let request = format!(
-        "POST /?query={query} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {len}\r\n\
-         Connection: close\r\n\r\n{body}",
-        query = url_encode(CLICKHOUSE_INSERT),
-        host = cfg.host_port,
-        len = body.len(),
-    );
+    // URL query params (e.g. `?database=dogress`, or `?user=&password=`) are
+    // passed through verbatim; `user:pass@` userinfo becomes Basic auth.
+    let mut request = String::with_capacity(body.len() + 256);
+    request.push_str("POST /?");
+    if !cfg.query_params.is_empty() {
+        request.push_str(&cfg.query_params);
+        request.push('&');
+    }
+    request.push_str("query=");
+    request.push_str(&url_encode(CLICKHOUSE_INSERT));
+    request.push_str(" HTTP/1.1\r\n");
+    request.push_str("Host: ");
+    request.push_str(&cfg.host_port);
+    request.push_str("\r\n");
+    if let Some((user, pass)) = &cfg.auth {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let token = B64.encode(format!("{user}:{pass}"));
+        request.push_str("Authorization: Basic ");
+        request.push_str(&token);
+        request.push_str("\r\n");
+    }
+    request.push_str("Content-Length: ");
+    request.push_str(&body.len().to_string());
+    request.push_str("\r\nConnection: close\r\n\r\n");
+    request.push_str(&body);
 
     let mut stream = tokio::net::TcpStream::connect(&cfg.host_port)
         .await
@@ -657,5 +720,60 @@ pub fn build_sink(
         other => Err(BuildSinkError::UnknownKind {
             kind: other.to_string(),
         }),
+    }
+}
+
+#[cfg(all(test, feature = "usage-clickhouse"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_url_anonymous() {
+        let cfg = parse_clickhouse_url("http://127.0.0.1:8123");
+        assert_eq!(cfg.host_port, "127.0.0.1:8123");
+        assert!(cfg.auth.is_none());
+        assert_eq!(cfg.query_params, "");
+    }
+
+    #[test]
+    fn parse_url_bare_host() {
+        let cfg = parse_clickhouse_url("clickhouse:8123");
+        assert_eq!(cfg.host_port, "clickhouse:8123");
+        assert!(cfg.auth.is_none());
+    }
+
+    #[test]
+    fn parse_url_userinfo_becomes_basic_auth() {
+        let cfg = parse_clickhouse_url("http://sh_admin:sH_9527!@clickhouse:8123");
+        assert_eq!(cfg.host_port, "clickhouse:8123");
+        assert_eq!(cfg.auth, Some(("sh_admin".into(), "sH_9527!".into())));
+        assert_eq!(cfg.query_params, "");
+    }
+
+    #[test]
+    fn parse_url_user_only() {
+        let cfg = parse_clickhouse_url("http://alice@clickhouse:8123");
+        assert_eq!(cfg.auth, Some(("alice".into(), "".into())));
+    }
+
+    #[test]
+    fn parse_url_query_passthrough() {
+        let cfg = parse_clickhouse_url("http://clickhouse:8123/?database=dogress&user=x");
+        assert_eq!(cfg.host_port, "clickhouse:8123");
+        assert!(cfg.auth.is_none(), "query user must NOT become Basic auth");
+        assert_eq!(cfg.query_params, "database=dogress&user=x");
+    }
+
+    #[test]
+    fn parse_url_userinfo_and_query() {
+        let cfg = parse_clickhouse_url("http://u:p@clickhouse:8123/?database=dogress");
+        assert_eq!(cfg.auth, Some(("u".into(), "p".into())));
+        assert_eq!(cfg.query_params, "database=dogress");
+    }
+
+    #[test]
+    fn parse_url_strips_crlf_from_credentials() {
+        let cfg = parse_clickhouse_url("http://u\r\n:pa\r\nss@clickhouse:8123");
+        assert_eq!(cfg.auth, Some(("u".into(), "pass".into())));
     }
 }

@@ -874,8 +874,8 @@ pub struct UsageRecord {
 
 ### 9.3 可选实现：`ClickHouseSink`（feature flag）
 
-- `Cargo.toml` feature `usage-clickhouse`（**零额外依赖**：sink 走 ClickHouse 原生 HTTP 接口 `INSERT … FORMAT JSONEachRow`，不使用 `clickhouse` crate）；
-- 配置 `HYDRA_CLICKHOUSE_URL`（**URL 不支持凭据**，需指向匿名实例）；
+- `Cargo.toml` feature `usage-clickhouse`（依赖极少：sink 走 ClickHouse 原生 HTTP 接口 `INSERT … FORMAT JSONEachRow`，不使用 `clickhouse` crate；`base64` 仅用于 URL userinfo 转 Basic Auth）；
+- 配置 `HYDRA_CLICKHOUSE_URL`：支持匿名 `http://host:8123`、**带凭据 `http://user:pass@host:8123`（转 Basic Auth）**、以及查询参数透传（`?database=dogress`、`?user=&password=`）；
 - 同样经 channel 异步批量写入；
 - 二者实现同一 `UsageSink` trait，启动按配置选择。**feature 开启时同一二进制内同时编译 `SqliteSink` 与 `ClickHouseSink`**，运行时由 `HYDRA_USAGE_SINK=sqlite|clickhouse` 切换，无需重编。
 
