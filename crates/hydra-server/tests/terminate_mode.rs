@@ -329,6 +329,89 @@ async fn full_body_forwarded_intact_and_key_swapped() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tenant_without_tenant_model_mapping_is_default_open() {
+    let auth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&auth_server)
+        .await;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"id":"x","object":"chat.completion","choices":[]}"#),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let pool = common::setup_pool().await;
+    // Seed the full routed graph EXCEPT `tenant_model`: with no model
+    // mapping the (revised §7.1) default-open gate lets every model through.
+    seed_provider(&pool, "p1", "openai", "OpenAI", &upstream.uri()).await;
+    repo::insert_provider_model(
+        &pool,
+        &ProviderModel {
+            id: "m1".into(),
+            key: "gpt-4".into(),
+            name: "gpt-4".into(),
+            provider_id: "p1".into(),
+            status: 1,
+        },
+    )
+    .await
+    .expect("insert provider_model");
+    seed_tenant(
+        &pool,
+        "t1",
+        "localhost",
+        &format!("{}/auth", auth_server.uri()),
+    )
+    .await;
+    repo::insert_tenant_provider(
+        &pool,
+        &TenantProvider {
+            id: "tp1".into(),
+            tenant_id: "t1".into(),
+            provider_id: "p1".into(),
+        },
+    )
+    .await
+    .expect("insert tenant_provider");
+    // NOTE: deliberately NO insert_tenant_model here.
+    seed_key(
+        &pool,
+        &StaticKeyProvider::new([1u8; 32], 1),
+        "pk1",
+        "p1",
+        "sk-upstream-secret",
+    )
+    .await;
+    seed_default_role(&pool, "t1").await;
+
+    let state = build_state(&pool).await;
+    let root = start_proxy(state);
+    let url = format!("{root}/v1/chat/completions");
+    let client = test_client();
+
+    let resp = send_until_ready(
+        &client,
+        &url,
+        r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    // The upstream received the request despite the missing tenant_model row.
+    let received = upstream.received_requests().await.expect("recording on");
+    assert!(
+        received.iter().any(|r| r.method.as_str() == "POST"),
+        "upstream must receive the forwarded request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sse_stream_is_forwarded_chunk_by_chunk() {
     let auth_server = MockServer::start().await;
     Mock::given(method("POST"))

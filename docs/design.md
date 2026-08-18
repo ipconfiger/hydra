@@ -78,7 +78,7 @@
 | 用量记录 | **可插拔 Sink，默认 SQLite，ClickHouse 为可选适配器** |
 | 限流计数器 | **内存滑动窗口**（单实例，重启丢失，对窗口限流可接受） |
 | 客户端鉴权 | **外部认证**：每租户**必填** `auth_url`（NOT NULL），缓存优先（默认 5 分钟 TTL），缺失则一律拒绝；提供 Admin 接口强制失效（详见 §11） |
-| 模型访问授权 | **`TenantModel` 作为访问闸门**：租户仅能访问其 `TenantModel` 列表内的模型（详见 §7.1） |
+| 模型访问授权 | **`TenantModel` 缺省放行闸门**：未配置映射的租户默认可用**全部模型**；一旦配置映射，则仅能访问列表内模型（详见 §7.1） |
 | 供应商健康 | **v1 内置内存熔断器**：N 次连续失败 → 内存标记 dead，候选选择跳过，后台探活恢复（详见 §8.4） |
 
 ### 1.4 Oracle Gate Review 修订说明
@@ -669,11 +669,13 @@ pub fn resolve(
     tenant: &Tenant,
     model_key: &str,
 ) -> Result<Vec<Candidate>, RouteError> {
-    // (0) TenantModel 访问闸门（修订 P1-B3）：model_key 必须在租户的 tenant_models 列表内
-    let allowed_models = cfg.tenant_models.get(&tenant.id)
-        .ok_or(RouteError::TenantForbidden)?;
-    if !allowed_models.contains(model_key) {
-        return Err(RouteError::ModelNotAllowed);   // → 403
+    // (0) TenantModel 访问闸门（缺省放行）：租户【未配置】tenant_models 映射
+    //     时默认放行所有模型；【一旦配置】映射即为白名单，映射外的模型拒绝
+    //     （ModelNotAllowed → 403）。配置为空集合与缺失条目同义。
+    if let Some(allowed_models) = cfg.tenant_models.get(&tenant.id) {
+        if !allowed_models.contains(model_key) {
+            return Err(RouteError::ModelNotAllowed);   // → 403
+        }
     }
 
     // (1) model_key -> 提供该模型且 status==1 的供应商
@@ -682,7 +684,7 @@ pub fn resolve(
         .unwrap_or_default();
     if by_model.is_empty() { return Err(RouteError::ModelNotFound); }
 
-    // (2) 租户允许的供应商
+    // (2) 租户允许的供应商（fail-closed：无 provider 映射 → TenantForbidden）
     let tenant_ok = cfg.tenant_providers.get(&tenant.id)
         .ok_or(RouteError::TenantForbidden)?;
 
@@ -730,9 +732,9 @@ pub fn resolve(
 
 ### 7.3 特殊规则（遵循提案）
 
-- **域名缺失 / localhost**：用 `localhost` 匹配租户（仍需 `TenantProvider` + `TenantModel` 授权）。
+- **域名缺失 / localhost**：用 `localhost` 匹配租户（仍需 `TenantProvider` 授权；`TenantModel` 缺省放行）。
 - **租户未匹配**：直接报错（404）。
-- **`TenantModel` 不含该 model**：报错（403 `ModelNotAllowed`）。
+- **`TenantModel` 已配置且不含该 model**：报错（403 `ModelNotAllowed`）。**未配置 `TenantModel` 映射的租户默认放行全部模型**（§7.1）。
 - **交集为空 / 全部熔断**：报错（403/503 `NoAvailableProvider`）。
 
 ---

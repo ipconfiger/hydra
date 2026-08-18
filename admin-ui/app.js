@@ -346,7 +346,7 @@ const CRUD = {
   },
   "tenant-models": {
     title: "Tenant Models", nav: "Tenant Models", icon: "gate", path: "/tenant-models", singular: "model gate",
-    desc: "Access gate — models a tenant is allowed to request.",
+    desc: "Model gate — default-open: a tenant with NO rows here can request ALL models; once any row exists, only listed models are allowed.",
     noEdit: true,
     columns: [
       { key: "id", label: "ID", mono: true },

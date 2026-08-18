@@ -107,6 +107,36 @@ fn resolve_tenant_model_gate_reject() {
     assert_eq!(err, RouteError::ModelNotAllowed);
 }
 
+/// T2.1b — tenant has NO `tenant_models` mapping ⇒ default-open: every model
+/// is allowed (revised §7.1 semantics: empty/unset = unrestricted).
+#[test]
+fn resolve_tenant_model_gate_default_open() {
+    let mut cfg = base_cfg();
+    // `gpt-5` is served by an online provider but is NOT in the tenant's
+    // (former) whitelist {gpt-4o} — with a mapping present it would 403.
+    cfg.models_by_key.insert(
+        "gpt-5".into(),
+        vec![ModelProvider {
+            provider_id: "p_a".into(),
+            weight: 1,
+        }],
+    );
+    // Sanity: with the mapping present the gate rejects gpt-5.
+    let tenant = tenant();
+    let b = alive_breaker();
+    assert_eq!(
+        resolve(&cfg, &b, &tenant, "gpt-5").unwrap_err(),
+        RouteError::ModelNotAllowed
+    );
+    // Drop the mapping → default-open: gpt-5 now resolves.
+    cfg.tenant_models.remove("t_acme");
+    let cands = resolve(&cfg, &b, &tenant, "gpt-5").expect("no mapping → all models allowed");
+    assert!(!cands.is_empty());
+    // And the previously-whitelisted model still resolves.
+    let cands2 = resolve(&cfg, &b, &tenant, "gpt-4o").expect("no mapping → all models allowed");
+    assert!(!cands2.is_empty());
+}
+
 /// T2.2 — model in the gate ⇒ proceeds (and succeeds here).
 #[test]
 fn resolve_tenant_model_gate_pass() {

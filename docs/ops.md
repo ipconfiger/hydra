@@ -483,8 +483,9 @@ Check, in order:
 2. **`weight`** — is it `0`? Weight 0 = soft-disabled (§7.2).
 3. **`status`** — is the model `status == 1`? `0`/`-1` are excluded from
    candidates.
-4. **TenantModel gate** — is the model in the tenant's `tenant_models`? If not
-   → 403 `model_not_allowed`.
+4. **TenantModel gate** — does the tenant have a `tenant_models` mapping? **No
+   mapping ⇒ all models allowed (default-open, §7.1)**. Mapping present but the
+   model absent → 403 `model_not_allowed`.
 5. **TenantProvider** — does the tenant have access to the provider? Empty
    intersection → `no_available_provider`.
 6. **api_key** — does the provider have at least one key? No key → filtered

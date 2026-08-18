@@ -145,11 +145,13 @@ pub struct Candidate {
 /// shell share one canonical type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteError {
-    /// `model_key` not in the tenant's `tenant_models` gate.
+    /// `model_key` outside the tenant's configured `tenant_models` whitelist
+    /// (only fires when the tenant HAS a mapping; no mapping = unrestricted).
     ModelNotAllowed,
     /// `model_key` unknown to the system (no online provider serves it).
     ModelNotFound,
-    /// Tenant disabled / has no providers configured.
+    /// Tenant disabled / has no providers configured (tenant_providers gate
+    /// is fail-closed; the tenant_models gate is default-open, see §7.1).
     TenantForbidden,
     /// Intersection of model-providers and tenant-providers empty, or all
     /// filtered out (dead / soft-disabled).

@@ -12,13 +12,15 @@
 //! describe the output.
 //!
 //! ## Pipeline (design §7.1)
-//! 0. **TenantModel gate** — `model_key` must be in the tenant's
-//!    `tenant_models` set, else [`RouteError::ModelNotAllowed`].
+//! 0. **TenantModel gate** — *default-open*: a tenant with **no** `tenant_models`
+//!    mapping is unrestricted (every model allowed). Once any mapping exists it
+//!    becomes a whitelist: `model_key` outside it ⇒
+//!    [`RouteError::ModelNotAllowed`].
 //! 1. **Online model providers** — providers serving `model_key` (the loader
 //!    only indexes `status == 1` rows into `models_by_key`); empty ⇒
 //!    [`RouteError::ModelNotFound`].
-//! 2. **Tenant providers** — the tenant's authorised provider set; absent ⇒
-//!    [`RouteError::TenantForbidden`].
+//! 2. **Tenant providers** — the tenant's authorised provider set (fail-closed:
+//!    absent ⇒ [`RouteError::TenantForbidden`]).
 //! 3. **Intersection** of (1) and (2); empty ⇒ [`RouteError::NoAvailableProvider`].
 //! 4. **Filter** — drop dead (`breaker.is_dead`), keyless (no api-keys), and
 //!    soft-disabled (`weight <= 0`); empty ⇒ [`RouteError::NoAvailableProvider`].
@@ -47,13 +49,14 @@ pub fn resolve(
     tenant: &Tenant,
     model_key: &str,
 ) -> Result<Vec<Candidate>, RouteError> {
-    // (0) TenantModel access gate (design §7.1 / wave-1 T2.1–T2.2).
-    let allowed_models = cfg
-        .tenant_models
-        .get(&tenant.id)
-        .ok_or(RouteError::TenantForbidden)?;
-    if !allowed_models.contains(model_key) {
-        return Err(RouteError::ModelNotAllowed);
+    // (0) TenantModel access gate (design §7.1, revised — default-open): a
+    // tenant with NO `tenant_models` mapping is unrestricted (all models
+    // allowed); once any mapping exists it is a whitelist — a model outside
+    // it is ModelNotAllowed.
+    if let Some(allowed) = cfg.tenant_models.get(&tenant.id) {
+        if !allowed.contains(model_key) {
+            return Err(RouteError::ModelNotAllowed);
+        }
     }
 
     // (1) Providers serving this model (online only — the loader guarantees
